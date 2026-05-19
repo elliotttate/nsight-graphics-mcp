@@ -232,26 +232,74 @@ The Python client in
   `root_parameters`, `descriptor_state`). These will start working as
   soon as `RpcMessageHeader.pack()` produces the correct wire bytes.
 
-## Sample bytes — the first send attempt
+## Sample bytes — the current send attempt (verified emit)
 
-For reference, the bytes that our client *currently* sends as the first
-handshake attempt are:
+Actual bytes our client emits, freshly measured (the earlier "size=74"
+note was incorrect — it's 62):
 
 ```
-54 08 00 00 00 00 00 4a                      ; transport header (size = 74)
-00 00 01                                     ; MessageHeader[0..2] = flags=0, is_valid=1
-00 00 00 00 00 00 00 00 00 00 00 00 00 00    ; MessageHeader[3..16] = zeros
-00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ; MessageHeader[17..31] = zeros
-02 00 00 00                                  ; MessageHeader[32..35] = category=2 (handshake)
-01 00 00 00                                  ; MessageHeader[36..39] = method=1   (Begin)
-00 00 00 00                                  ; MessageHeader[40..43] = zeros
-01 00 00 00 00 00 00 00                      ; MessageHeader[48..55] = ticket_id=1
-00 00 00 00                                  ; MessageHeader[56..59] = sertype=0
+54 08 00 00 00 00 00 3e                      ; transport header (size = 62 = 0x3e)
+01 00 01 00                                  ; MessageHeader[0..3] is_valid=1 at +0 AND +2
+00 00 00 00 00 00 00 00 00 00 00 00          ; MessageHeader[4..15]  zeros
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ; MessageHeader[16..30] zeros
+00                                           ; MessageHeader[31]     zero
+02 00 00 00                                  ; MessageHeader[32..35] category=2  (handshake)
+01 00 00 00                                  ; MessageHeader[36..39] method=1    (Begin)
+00 00 00 00                                  ; MessageHeader[40..43] zeros
+00 00 00 00                                  ; MessageHeader[44..47] zeros
+01 00 00 00 00 00 00 00                      ; MessageHeader[48..55] ticket_id=1
+00 00 00 00                                  ; MessageHeader[56..59] sertype=0
 08 01                                        ; protobuf body: PbHandshakeBeginMessage(id=1)
 ```
 
-The server currently crashes on this input (rather than replying), so we
-have evidence that the message-header wire layout is **not** the raw
-60-byte struct. The next thing to try is option B (the compact 20-byte
-layout) — flip `RpcMessageHeader.WIRE_LAYOUT = "compact"` once that
-encoder is added.
+## Live-probe results (2026-05-19)
+
+The server **silently drops** the frame and closes the TCP session
+regardless of payload. Tested combinations against a one-shot server
+(each row is a separate `ngfx-rpc.exe` launch, since the server exits on
+disconnect):
+
+| channel | category | method | body | result |
+|---|---|---|---|---|
+| 0 | 2 (handshake) | 1 (Begin) | `08 01` | 0 bytes back, server exits |
+| 1 | 1 (Diagnostics) | 6 (DataBuffer) | `08 01` | 0 bytes back, server exits |
+| 0 | 1 (Diagnostics) | 6 (DataBuffer) | `08 01` | 0 bytes back, server exits |
+| 1 | 2 (handshake) | 1 (Begin) | `08 01` | 0 bytes back, server exits |
+
+stderr from the server stays empty (no error printed to console). The
+log-call signatures the dispatcher uses on bad headers
+(`"Received message, but header is invalid. Cannot deserialize this message."`)
+go to Nsight's binary log, not stderr — capturing those would help.
+
+## Key finding from this iteration
+
+The dispatcher's validity gate `sub_1409216C0` is *literally*
+`return *a1` — i.e. it reads the **first byte** (offset +0) of whatever
+the message's vfunc-1 returns. There are TWO validity bits in the
+MessageHeader:
+
+* byte **+0** — gates the dispatcher's main path (`sub_1409216C0`)
+* byte **+2** — gates `hdr_is_valid` (`sub_140985570`), used elsewhere
+
+The client must set **both** to 1. The earlier version of `pack()` set
+only +2 and the dispatcher silently dropped the frame on the validity
+check before even reading category/method. Now fixed; but the server
+still drops with both bytes set, so there's at least one more required
+field somewhere in the 60-byte struct (or the wire layout isn't a flat
+struct dump at all).
+
+## Next concrete RE step
+
+The dispatcher gets the validity-check input via:
+
+```c
+v6 = (*(__int64 (__fastcall **)(_QWORD))(*(_QWORD *)*a3 + 8LL))(*a3);
+```
+
+— i.e. vfunc-1 of whatever `*a3` is (probably `NV::TPS::Message`). If
+vfunc-1 returns the *MessageHeader* pointer, the wire format probably
+includes the MessageHeader byte-for-byte. If it returns a *different*
+struct (e.g. a tiny validity-bool wrapper), the wire format may have a
+separate header that gets decoded into the MessageHeader by some
+parser. Decompiling vfunc-1 of `NV::TPS::Message::vftable` is the
+single most informative next step.

@@ -258,13 +258,22 @@ class RpcMessageHeader:
     """The C++ ``NV::TPS::MessageHeader`` mirror.
 
     Field offsets confirmed from binary:
-      * +2  is_valid (u8)         — set to 1 to indicate a valid header
-      * +32 category (u32)        — global category enum
-      * +36 method   (u32)        — method id within the category
+      * +0  is_valid (u8)         — checked by ``sub_1409216C0`` (the
+                                    main dispatcher's validity gate)
+      * +2  is_valid (u8)         — checked by ``hdr_is_valid``
+                                    (``sub_140985570``)
+      * +32 category (u32)        — global category enum, read via
+                                    ``hdr_get_category`` (``sub_1409854B0``)
+      * +36 method   (u32)        — method id, ``hdr_get_method``
+                                    (``sub_140985560``)
       * +48 ticket_id (u64)       — request/response correlation
-      * +56 sertype  (u32)        — serialization format
+      * +56 sertype  (u32)        — serialization format,
+                                    ``hdr_get_sertype`` (``sub_140985540``)
 
-    All other bytes are zero by default.
+    All other bytes are zero by default. NOTE: setting both is_valid
+    bytes correctly is NECESSARY but apparently not sufficient — live
+    probes against a TCP-mode server still drop the frame. See
+    ``docs/RPC_PROTOCOL.md`` for the unresolved unknowns.
     """
 
     category: int
@@ -283,6 +292,14 @@ class RpcMessageHeader:
         if self.WIRE_LAYOUT != "raw_struct":
             raise NotImplementedError(self.WIRE_LAYOUT)
         buf = bytearray(MESSAGE_HEADER_IN_MEM_SIZE)
+        # ``is_valid`` lives at TWO offsets:
+        #   * byte +0  — checked by ``sub_1409216C0`` (= ``return *a1``)
+        #     in the main dispatcher path
+        #   * byte +2  — checked by ``hdr_is_valid`` (``sub_140985570``)
+        # Set BOTH so neither path rejects us. Discovered by ground-truth
+        # decompile of sub_1409216C0 vs sub_140985570; the previous client
+        # version only set +2 and the dispatcher silently dropped the frame.
+        buf[0] = self.is_valid & 0xFF
         buf[2] = self.is_valid & 0xFF
         struct.pack_into("<I", buf, 32, self.category & 0xFFFFFFFF)
         struct.pack_into("<I", buf, 36, self.method & 0xFFFFFFFF)
