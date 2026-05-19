@@ -1,0 +1,49 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+
+# --- venvs ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- editor / IDE ---
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# --- tests / type checking ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+
+# --- nsight-graphics-mcp caches ---
+# Per-capture indexes the MCP drops next to a capture
+*.ngfxmcp/
+.ngfxmcp_cpp_calls.db
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- local secrets / config overrides ---
+.env
+.env.local
+*.local.toml
