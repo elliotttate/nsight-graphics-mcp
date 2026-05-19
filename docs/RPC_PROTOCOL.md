@@ -334,6 +334,21 @@ error sink" path. The server is in some pre-session state where every
 RPC bounces. **The transport works**, but there's a session-setup step
 the real ngfx-ui client does first that we haven't replicated yet.
 
+### Tried and ruled out (2026-05-19)
+
+* **AttachMessage / TargetAttachedMessage have NO fields** — confirmed
+  via the schema pool. So sending them with empty body IS the correct
+  payload format. The "empty body" sweep covered that case; the server
+  still rejected. So body content is not the discriminator.
+* **OutputDebugString listener** (`tools/dbgview_capture.py`) — ngfx-rpc
+  imports `OutputDebugStringA/W` but doesn't actually call them on this
+  reject path. The actual log sink is `sub_1408BACF0` (still un-traced),
+  so capturing "why" via OutputDebugString doesn't work.
+* **Multiple connection lifetime** — verified the server's TCP listener
+  accepts repeated frames on one connection (33+ tested) when frames are
+  valid. The "one-shot server" of the earlier report was wrong — it was
+  the result of sending invalid frames that the server then refused.
+
 ### Next iteration
 
 Hypotheses for what unlocks a real reply:
