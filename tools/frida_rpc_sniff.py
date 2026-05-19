@@ -264,6 +264,89 @@ function hookReadFile() {
     });
 }
 
+/* NTDLL-level hooks — catch I/O that bypasses kernel32 (async / OVERLAPPED
+   / IOCP all go through these). NtWriteFile/NtReadFile signature:
+     NTSTATUS Nt{Write,Read}File(
+       HANDLE FileHandle,        // args[0]
+       HANDLE Event,             // args[1]
+       PIO_APC_ROUTINE Apc,      // args[2]
+       PVOID ApcContext,         // args[3]
+       PIO_STATUS_BLOCK Iosb,    // args[4]
+       PVOID Buffer,             // args[5]
+       ULONG Length,             // args[6]
+       PLARGE_INTEGER ByteOff,   // args[7]
+       PULONG Key);              // args[8]
+
+   IO_STATUS_BLOCK { NTSTATUS Status; ULONG_PTR Information; } — the
+   Information field carries the actual byte count after the call. */
+
+function hookNtWriteFile() {
+    var p = resolveExport('ntdll.dll', 'NtWriteFile');
+    Interceptor.attach(p, {
+        onEnter: function (args) {
+            this.handle = args[0].toString();
+            this.iosb = args[4];
+            this.buf = args[5];
+            this.length = args[6].toInt32();
+            // Check magic NOW (buffer is filled by caller before the call)
+            this.isRpc = looksLikeRpcFrame(this.buf, this.length)
+                          || rpcHandles[this.handle] !== undefined;
+        },
+        onLeave: function (retval) {
+            if (!this.isRpc || this.length <= 0) return;
+            // For sync calls, we can read iosb.Information for actual bytes
+            // written. For async (STATUS_PENDING=0x103), the count isn't
+            // ready until the completion. Best-effort read regardless.
+            var actual = this.length;
+            try {
+                if (!this.iosb.isNull()) {
+                    actual = this.iosb.add(Process.pointerSize).readULong();
+                    if (actual <= 0 || actual > this.length) actual = this.length;
+                }
+            } catch (e) { /* fall through */ }
+            var data = bufBytes(this.buf, actual);
+            if (data) send({type: 'pipe_write', handle: this.handle,
+                            path: rpcHandles[this.handle] || '(nt)',
+                            len: actual, ts: Date.now(),
+                            thread: Process.getCurrentThreadId()}, data);
+        }
+    });
+}
+
+function hookNtReadFile() {
+    var p = resolveExport('ntdll.dll', 'NtReadFile');
+    Interceptor.attach(p, {
+        onEnter: function (args) {
+            this.handle = args[0].toString();
+            this.iosb = args[4];
+            this.buf = args[5];
+            this.lenReq = args[6].toInt32();
+            // On entry, buffer is empty — we'll inspect on leave
+        },
+        onLeave: function (retval) {
+            // STATUS_SUCCESS = 0; STATUS_PENDING = 0x103. For PENDING,
+            // the buffer may not be filled yet — but for sync reads we
+            // can read it now.
+            var actual = this.lenReq;
+            try {
+                if (!this.iosb.isNull()) {
+                    actual = this.iosb.add(Process.pointerSize).readULong();
+                    if (actual <= 0 || actual > this.lenReq) actual = this.lenReq;
+                }
+            } catch (e) { /* fall through */ }
+            if (actual <= 0) return;
+            var isRpc = looksLikeRpcFrame(this.buf, Math.min(actual, 8))
+                         || rpcHandles[this.handle] !== undefined;
+            if (!isRpc) return;
+            var data = bufBytes(this.buf, actual);
+            if (data) send({type: 'pipe_read', handle: this.handle,
+                            path: rpcHandles[this.handle] || '(nt)',
+                            len: actual, ts: Date.now(),
+                            thread: Process.getCurrentThreadId()}, data);
+        }
+    });
+}
+
 try { hookSend(); } catch (e) { send({type: 'err', where: 'send', msg: e.toString()}); }
 try { hookRecv(); } catch (e) { send({type: 'err', where: 'recv', msg: e.toString()}); }
 try { hookWSASend(); } catch (e) { send({type: 'err', where: 'wsasend', msg: e.toString()}); }
@@ -272,6 +355,8 @@ try { hookCreateFileW(); } catch (e) { send({type: 'err', where: 'createfile', m
 try { hookCreateNamedPipe(); } catch (e) { send({type: 'err', where: 'createpipe', msg: e.toString()}); }
 try { hookWriteFile(); } catch (e) { send({type: 'err', where: 'writefile', msg: e.toString()}); }
 try { hookReadFile(); } catch (e) { send({type: 'err', where: 'readfile', msg: e.toString()}); }
+try { hookNtWriteFile(); } catch (e) { send({type: 'err', where: 'ntwritefile', msg: e.toString()}); }
+try { hookNtReadFile(); } catch (e) { send({type: 'err', where: 'ntreadfile', msg: e.toString()}); }
 
 send({type: 'hooked', pid: Process.id, name: Process.mainModule.name});
 """
@@ -392,12 +477,110 @@ def attach(target, log_path: Path | None) -> frida.core.Session:
     return session
 
 
+def _poll_for_children(device, parent_pid: int, hook_pid_fn,
+                       names_of_interest: set[str], stop_evt) -> None:
+    """Background thread: poll the process list every 250ms for new
+    processes whose parent is ``parent_pid``. Attaches the sniffer
+    hooks to each one. This is a Windows workaround for the fact that
+    frida.Device.enable_spawn_gating() is "not yet supported on this OS"
+    in Frida 17.x.
+    """
+    import time as _t
+    seen = set()
+    while not stop_evt.is_set():
+        try:
+            for p in device.enumerate_processes():
+                if p.pid in seen:
+                    continue
+                # Filter: must look like one of our interesting children
+                if names_of_interest and p.name.lower() not in {n.lower() for n in names_of_interest}:
+                    continue
+                # Skip ourselves / the parent
+                if p.pid == parent_pid:
+                    continue
+                seen.add(p.pid)
+                # Verify parent chain via psutil if available; else just
+                # trust the name match.
+                try:
+                    import psutil
+                    ppid = psutil.Process(p.pid).ppid()
+                    if ppid != parent_pid:
+                        continue
+                except Exception:
+                    pass
+                print(f"[+] watchdog: new child {p.name} pid={p.pid}; "
+                      f"attaching hooks")
+                try:
+                    hook_pid_fn(p.pid, p.name)
+                except Exception as e:
+                    print(f"[!] watchdog hook failed for pid={p.pid}: {e}")
+        except Exception as e:
+            print(f"[!] watchdog iteration error: {e}")
+        stop_evt.wait(0.25)
+
+
+def spawn(exe_path: str, args: list[str], log_path: Path | None,
+          *, follow_children: bool = False
+          ) -> tuple[frida.core.Session, int]:
+    """Spawn a process suspended, load hooks, then resume.
+
+    More reliable than attach() for processes that crash on runtime
+    code injection (Qt apps often do). The hooks are installed before
+    a single instruction of the target runs.
+
+    If ``follow_children`` is True, also installs hooks into every
+    child process the target spawns — necessary to catch ngfx-rpc
+    when ngfx-ui forks it.
+    """
+    device = frida.get_local_device()
+    log_file = open(log_path, "a", encoding="utf-8") if log_path else None
+
+    def _hook_pid(pid: int, name: str) -> frida.core.Session:
+        s = device.attach(pid)
+        scr = s.create_script(HOOK_JS)
+        scr.on("message", lambda m, d: on_message(m, d, log_file))
+        scr.load()
+        print(f"[*] hooks loaded into {name} pid={pid}")
+        return s
+
+    print(f"[*] spawning {exe_path!r} suspended")
+    pid = device.spawn([exe_path] + list(args))
+    print(f"[*] spawned suspended pid={pid}; attaching")
+    session = _hook_pid(pid, Path(exe_path).name)
+
+    if follow_children:
+        # Windows Frida 17.x doesn't support spawn-gating — use polling
+        # watchdog instead. Catches ngfx-rpc within ~250ms of its launch.
+        import threading
+        stop_evt = threading.Event()
+        watchdog = threading.Thread(
+            target=_poll_for_children,
+            args=(device, pid, _hook_pid, {"ngfx-rpc.exe"}, stop_evt),
+            daemon=True, name="child-watchdog",
+        )
+        watchdog.start()
+        print("[*] child watchdog running (polls every 250ms for ngfx-rpc)")
+
+    print(f"[*] resuming root pid={pid}")
+    device.resume(pid)
+    return session, pid
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--attach", action="append", default=[],
                     help="process name or PID to attach to (repeatable)")
     ap.add_argument("--attach-all", action="store_true",
                     help="attach to every running ngfx-* process")
+    ap.add_argument("--spawn", default=None,
+                    help="path to an exe to spawn suspended + hook + resume "
+                         "(more reliable than --attach for Qt apps that crash "
+                         "on runtime injection)")
+    ap.add_argument("--spawn-arg", action="append", default=[],
+                    help="argument to pass to --spawn (repeatable)")
+    ap.add_argument("--follow-children", action="store_true",
+                    help="with --spawn, enable spawn-gating so children get "
+                         "hooks too (catches ngfx-rpc when ngfx-ui forks it)")
     ap.add_argument("--log", default=None, help="append output to this file")
     args = ap.parse_args()
 
@@ -410,12 +593,21 @@ def main():
             if p.name.lower().startswith("ngfx") or "nsight" in p.name.lower():
                 targets.append(p.name)
 
-    if not targets:
-        print("no targets — pass --attach <name|pid> or --attach-all")
-        return 2
-
     log_path = Path(args.log).resolve() if args.log else None
     sessions = []
+
+    if args.spawn:
+        try:
+            sess, _pid = spawn(args.spawn, args.spawn_arg, log_path,
+                                follow_children=args.follow_children)
+            sessions.append(sess)
+        except Exception as e:
+            print(f"[!] failed to spawn {args.spawn!r}: {e}")
+
+    if not targets and not args.spawn:
+        print("no targets — pass --attach <name|pid> / --attach-all / --spawn <exe>")
+        return 2
+
     for t in targets:
         try:
             sessions.append(attach(t, log_path))

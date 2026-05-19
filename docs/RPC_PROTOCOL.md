@@ -334,6 +334,67 @@ error sink" path. The server is in some pre-session state where every
 RPC bounces. **The transport works**, but there's a session-setup step
 the real ngfx-ui client does first that we haven't replicated yet.
 
+### Live-capture wall (2026-05-19, second session)
+
+After the wire format was decoded I attempted to capture a real
+`ngfx-ui` ↔ `ngfx-rpc` handshake by hooking process I/O. Three Frida
+modes failed in three distinct ways:
+
+| Mode | Outcome |
+| --- | --- |
+| `frida.attach()` runtime injection | ngfx-ui crashes shortly after attach |
+| Custom `frida.spawn()` with child watchdog | Hooks install cleanly into both ngfx-ui and (via watchdog) ngfx-rpc; sniffer process dies before any pipe I/O is captured |
+| `frida-trace -f` (Frida's CLI tracer) | ngfx-ui process is alive but its **main window never appears** — initialisation stalls under the trace agent |
+
+Hooks installed cover `ws2_32!send/recv/WSASend/WSARecv`,
+`kernel32!CreateFileW/CreateNamedPipeW/WriteFile/ReadFile`, and
+`ntdll!NtWriteFile/NtReadFile`. Plenty of Qt + auto-updater pipe activity
+was captured proving the hooks fire — but **zero RPC bytes** crossed
+through any of them. The likely-but-unconfirmed reason: bulk data
+between ngfx-ui and ngfx-rpc goes through **shared memory**
+(`CreateFileMapping` + `MapViewOfFile`), with the named pipe carrying
+only tiny control frames that happen in the first ~100 ms before any
+hook can attach. Memory-mapped reads/writes have no syscalls per byte,
+so API-level hooking fundamentally can't see them.
+
+Tools committed for future iteration:
+
+* `tools/frida_rpc_sniff.py` — custom Frida sniffer with named-pipe
+  hooks, NTDLL hooks, child-watchdog (polling fallback for Frida 17's
+  missing spawn-gating on Windows), spawn-mode launcher.
+* `tools/rpc_sweep.py` — single-connection probe sweep over
+  (channel, category, method, body) combinations.
+
+Next angles worth trying in a fresh session (none guaranteed):
+
+1. **PE-patch ngfx-rpc.exe with IDA Pro 9.0 headless.** Add a
+   trampoline at the entry of `NtWriteFile` import that calls a logger
+   stub before delegating. Requires writing the stub in assembly OR
+   pairing the patch with a small DLL.
+2. **ETW kernel trace** via `logman create trace`/`xperf` with the
+   `Microsoft-Windows-Kernel-File` provider. Sees every file-handle
+   operation at kernel level, bypassing all user-mode hook evasion.
+   Can't see the buffer bytes, only the lengths/handles — but combined
+   with our schema pool we could still infer the (category, method)
+   pattern from message sizes.
+3. **Sysinternals Process Monitor (procmon)** + bootlogging — uses a
+   signed kernel driver, captures file I/O metadata + a short data
+   preview. Easier than ETW, less complete.
+4. **Pktmon on loopback** + a config that forces ngfx-rpc into TCP
+   mode (`--transport TCP --base-port N`). The named-pipe default
+   wraps everything in shared-mem fast paths; TCP forces it through
+   actual socket I/O. Unclear whether ngfx-ui can be steered to a
+   non-default ngfx-rpc.
+
+### Practical reminder
+
+Per-event arg extraction (the original user goal that motivated this
+RE) is **already solved via the C++-Capture roundtrip path** that's
+shipped in `cpp_capture_parser.py` + `pso_resolver.py` + the
+`ngfx_cpp_capture_*` MCP tools. The handshake-capture work is a
+research bypass for a future feature, not a blocker for current
+queries.
+
 ### Tried and ruled out (2026-05-19)
 
 * **AttachMessage / TargetAttachedMessage have NO fields** — confirmed
