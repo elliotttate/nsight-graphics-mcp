@@ -156,10 +156,122 @@ function hookWSARecv() {
     });
 }
 
+/* Named-pipe hooks. ngfx-ui actually uses named pipes by default
+   (`--transport named-pipe`), so the Winsock hooks above see nothing
+   for the real handshake. WriteFile/ReadFile see everything but are
+   noisy — we filter by inspecting the first 2 bytes for the 'T 08'
+   RPC frame magic and only log buffers that match. */
+
+/* Track which file handles look like RPC named pipes so we can filter
+   noisy WriteFile/ReadFile activity (font cache, registry, etc.). */
+var rpcHandles = {};
+
+function hookCreateFileW() {
+    var p = resolveExport('kernel32.dll', 'CreateFileW');
+    Interceptor.attach(p, {
+        onEnter: function (args) {
+            this.name = args[0].readUtf16String();
+        },
+        onLeave: function (retval) {
+            var fn = this.name || '';
+            if (fn && fn.toLowerCase().indexOf('\\pipe\\') >= 0) {
+                rpcHandles[retval.toString()] = fn;
+                send({type: 'pipe_open', handle: retval.toString(), path: fn,
+                      ts: Date.now(),
+                      thread: Process.getCurrentThreadId()});
+            }
+        }
+    });
+}
+
+function hookCreateNamedPipe() {
+    var p = resolveExport('kernel32.dll', 'CreateNamedPipeW');
+    Interceptor.attach(p, {
+        onEnter: function (args) {
+            this.name = args[0].readUtf16String();
+        },
+        onLeave: function (retval) {
+            var fn = this.name || '';
+            rpcHandles[retval.toString()] = fn;
+            send({type: 'pipe_create', handle: retval.toString(), path: fn,
+                  ts: Date.now(),
+                  thread: Process.getCurrentThreadId()});
+        }
+    });
+}
+
+function looksLikeRpcFrame(buf, len) {
+    if (len < 8) return false;
+    try {
+        var b0 = buf.readU8();
+        var b1 = buf.add(1).readU8();
+        return b0 === 0x54 && b1 === 0x08;
+    } catch (e) { return false; }
+}
+
+function hookWriteFile() {
+    var p = resolveExport('kernel32.dll', 'WriteFile');
+    Interceptor.attach(p, {
+        onEnter: function (args) {
+            this.handle = args[0].toString();
+            this.buf = args[1];
+            this.len = args[2].toInt32();
+            this.isRpc = rpcHandles[this.handle] !== undefined
+                          || looksLikeRpcFrame(this.buf, this.len);
+        },
+        onLeave: function (retval) {
+            if (!this.isRpc || this.len <= 0) return;
+            var data = bufBytes(this.buf, this.len);
+            if (data) send({type: 'pipe_write', handle: this.handle,
+                            path: rpcHandles[this.handle] || null,
+                            len: this.len, ts: Date.now(),
+                            thread: Process.getCurrentThreadId()}, data);
+        }
+    });
+}
+
+function hookReadFile() {
+    var p = resolveExport('kernel32.dll', 'ReadFile');
+    Interceptor.attach(p, {
+        onEnter: function (args) {
+            this.handle = args[0].toString();
+            this.buf = args[1];
+            this.lenReq = args[2].toInt32();
+            this.lenOut = args[3];
+            this.isRpc = rpcHandles[this.handle] !== undefined;
+        },
+        onLeave: function (retval) {
+            if (!this.isRpc) {
+                // Late check: maybe it's a pipe handle we missed but the
+                // buffer is short and starts with T 08
+                if (looksLikeRpcFrame(this.buf, Math.min(this.lenReq, 8))) {
+                    this.isRpc = true;
+                } else {
+                    return;
+                }
+            }
+            var actual = this.lenReq;
+            try {
+                if (!this.lenOut.isNull()) actual = this.lenOut.readU32();
+            } catch (e) { /* fall through */ }
+            if (actual <= 0) return;
+            var data = bufBytes(this.buf, actual);
+            if (data) send({type: 'pipe_read', handle: this.handle,
+                            path: rpcHandles[this.handle] || null,
+                            len: actual, ts: Date.now(),
+                            thread: Process.getCurrentThreadId()}, data);
+        }
+    });
+}
+
 try { hookSend(); } catch (e) { send({type: 'err', where: 'send', msg: e.toString()}); }
 try { hookRecv(); } catch (e) { send({type: 'err', where: 'recv', msg: e.toString()}); }
 try { hookWSASend(); } catch (e) { send({type: 'err', where: 'wsasend', msg: e.toString()}); }
 try { hookWSARecv(); } catch (e) { send({type: 'err', where: 'wsarecv', msg: e.toString()}); }
+try { hookCreateFileW(); } catch (e) { send({type: 'err', where: 'createfile', msg: e.toString()}); }
+try { hookCreateNamedPipe(); } catch (e) { send({type: 'err', where: 'createpipe', msg: e.toString()}); }
+try { hookWriteFile(); } catch (e) { send({type: 'err', where: 'writefile', msg: e.toString()}); }
+try { hookReadFile(); } catch (e) { send({type: 'err', where: 'readfile', msg: e.toString()}); }
 
 send({type: 'hooked', pid: Process.id, name: Process.mainModule.name});
 """
@@ -227,9 +339,17 @@ def on_message(message, data, log_file=None):
     if pt == "err":
         print(f"[!] hook setup error in {p.get('where')}: {p.get('msg')}")
         return
+    if pt in ("pipe_open", "pipe_create"):
+        ev = "opened" if pt == "pipe_open" else "created"
+        line = (f"[+] pipe {ev}: {p.get('path')!r} handle={p.get('handle')} "
+                f"thread={p.get('thread')}")
+        print(line)
+        if log_file:
+            log_file.write(line + "\n"); log_file.flush()
+        return
 
-    # Data messages — actual send/recv buffers
-    direction = ">>>" if pt in ("send", "wsasend") else "<<<"
+    # Data messages — send/recv (sockets) or pipe_write/pipe_read (named pipe)
+    direction = ">>>" if pt in ("send", "wsasend", "pipe_write") else "<<<"
     length = p.get("len", 0)
     ts = p.get("ts", 0)
     line = (f"\n[{ts}] {direction} {pt:8s} fd={p.get('fd', '?')} "
