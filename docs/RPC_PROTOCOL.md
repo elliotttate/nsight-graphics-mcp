@@ -289,11 +289,73 @@ ticket_id, and replied. The reply body is empty — likely because we
 guessed wrong on the (category=2, method=1) for the handshake, but the
 underlying transport + header now works end-to-end.
 
-**Next iteration:** determine which (category, method) actually triggers
-a meaningful handshake. The `BinaryReplayMethod` proto enum gives 110
-method ids; the categories table seems to be `(1=Diagnostics, ...)` per
-the recv-pinger constants. Trying `method=14 (EventInfo)` or
-`method=8 (Metadata)` against `category=1` is the natural next step.
+### Category and method enums (from the schema pool)
+
+```
+NV.TPS.System.SystemCategory:
+  0 CategoryInvalid       1 CategoryDiagnostics    2 CategorySystemInfo
+  3 CategoryDiscovery     4 CategoryHandshake      5 CategoryDeviceInfo
+  6 CategoryConnection    7 CategoryLocalDiscovery
+
+NV.Pylon.Replay.Category:
+  0 CategoryInvalid       1 CategoryBinaryReplay   (separate namespace —
+                                                    probably keyed by channel)
+
+NV.TPS.System.HandshakeMethod:        NV.TPS.System.DiagnosticsMethod:
+  1 MethodHandshakeBegin                2 PingRequest    3 PingResponse
+  2 MethodHandshakeEnd                  4 DataBuffersRequest  5 DataBuffersReply
+
+NV.Pylon.Replay.BinaryReplayMethod:
+  1 MethodLaunchRequest        2 MethodLaunchReply
+  8 MethodMetadataRequest      9 MethodMetadataReply
+  14 MethodEventInfoRequest    16 MethodEventDetailsRequest
+  33 MethodApiInspectorStateRequest    63 MethodDescriptorStateRequest
+  67 MethodRootParametersRequest       (...110 total)
+```
+
+### Sweep against the live server (2026-05-19)
+
+Connection **stays alive** across many sends (verified ≥33 frames on one
+TCP session — the previous "TCP server is one-shot" observation was a
+symptom of sending invalid frames, not a hard limit).
+
+Swept every reasonable (channel, category, method) combination, both
+with empty bodies and with properly-protobuf-serialised request bodies
+(`PbHandshakeBeginMessage`, `PingRequestMessage`, `GetSystemInfoRequest`,
+etc.). **Every reply is identical**:
+
+```
+cat=0  meth=0  slot=11  flags=0  body=(empty)
+```
+
+The constant `slot=11` across all categories/methods/channels suggests
+it's a fixed routing identifier — probably the "rejected / route to
+error sink" path. The server is in some pre-session state where every
+RPC bounces. **The transport works**, but there's a session-setup step
+the real ngfx-ui client does first that we haven't replicated yet.
+
+### Next iteration
+
+Hypotheses for what unlocks a real reply:
+
+1. **Target-attach handshake required first.** `ConnectionMethod` has
+   `MethodAttachMessage=1` / `MethodTargetAttachedMessage=7`; the server
+   may require an `AttachMessage` on `CategoryConnection=6` before any
+   `Diagnostics`/`SystemInfo`/etc. RPC works. Tried empty body, got
+   same reject — likely needs a real `AttachMessage` payload.
+2. **`slot` field carries a session id.** All our requests send
+   `slot=0`; the server's `slot=11` reply may mean "establish session
+   on slot N first then resend with `slot=N`". Worth trying
+   `slot=11` outgoing.
+3. **The "slot" RTTI symbol** (decompiled as `sub_140985DD0` which
+   accepts a separate object then writes into the header) hints that
+   slot is more structured than a plain byte — chase its caller(s) to
+   see how the real client populates it.
+
+Mechanical follow-up: instrument the server with the
+`NSIGHT_VERBOSE_RPC=1`-style env vars to get its log output, then probe
+again — the server already has `MethodMap::TryGetMethodHandler` log
+calls that would reveal exactly which lookups fail.
 
 ## Sample bytes — the current send attempt (verified emit)
 
