@@ -202,6 +202,35 @@ The same parser is used by `ngfx_find_calls_by_arg` and by
 | `ngfx_event_stream_diff` | **Deeper:** diff the per-event function streams via LCS. Returns per-function histogram delta, per-kind histogram delta, contiguous insert/delete/replace clusters, and (if both captures have a C++-Capture index) per-event arg diffs. |
 | `ngfx_function_stream_diff` | Lightweight name-only diff over raw `--metadata-functions` output. |
 
+### PSO â†’ DXBC / SPIR-V hash mapping
+
+Nsight's CLI does **not** expose the link between a PSO (D3D12 pipeline /
+Vulkan VkPipeline) and the shader bytecode hashes it uses. The protobuf
+schema *does* have it (`NV.Pylon.Replay.PbPipelineShaderStageInfo` â€”
+fields `pipeline`, `driverAppHash`, `stage`) but extracting it from a
+saved `.ngfx-gfxcap` is part of the in-progress capture decoder.
+
+The path that works today: parse the *Generate C++ Capture* emitted
+source. Shader bytecode is emitted as flat `static const unsigned char`
+arrays â€” DXBC blobs have the Microsoft compiler's 128-bit MD5 hash baked
+in at bytes 4..20 of the container (the exact bytes Nsight / PIX /
+RenderDoc display as the shader identity). For SPIR-V we compute SHA-1
+of the blob so Vulkan shaders still get a stable identity.
+
+PSO creation calls (`CreateGraphicsPipelineState` /
+`CreateComputePipelineState` / `vkCreateGraphicsPipelines` /
+`vkCreateComputePipelines` / `vkCreateRayTracingPipelinesKHR`) reference
+those byte-array symbols (D3D12) or `vkCreateShaderModule` handles
+(Vulkan). The indexer matches them up.
+
+| Tool | What it answers |
+| --- | --- |
+| `ngfx_pso_index` | Walk a C++-Capture project, parse every shader byte-array + every PSO creation call, write `shader_blobs` + `pso_shaders` tables to the existing C++-Capture index DB. |
+| `ngfx_pso_get` | Look up one PSO's full stage map: each stage â†’ `{shader_symbol, format (dxbc/dxil/spirv), hash_hex, hash_source, declared_byte_count, head_hex}`. |
+| `ngfx_pso_list` | Enumerate every indexed PSO with a one-line stage summary (`VS:g_VS_xxx, PS:g_PS_yyy`). |
+| `ngfx_pso_find_by_shader` | Reverse lookup: given a shader symbol OR a DXBC/SPIR-V hash, which PSOs use it (and as which stage)? Useful when a shader-debugger or perf trace gives you a hash. |
+| `ngfx_shader_blobs_list` | Enumerate every indexed shader byte-array (filterable by format / hash). |
+
 ### Object handle / UID resolver
 
 "What wrote to this buffer?" without the GUI. Given a uid or canonical
@@ -272,7 +301,7 @@ index, and (when present) the C++-Capture index.
 
 ## How big is the surface?
 
-**105 MCP tools** as of this writing, grouped by the sections below.
+**110 MCP tools** as of this writing, grouped by the sections below.
 Run `nsight-graphics-mcp --list-tools` (or import the package and inspect
 `server`) for an up-to-date enumeration.
 
@@ -506,7 +535,30 @@ ngfx_event_stream_diff(
 # + arg-level diff if both have a C++-Capture index.
 ```
 
-### 14. Browse the protobuf schema (RE-derived)
+### 14. PSO â†’ DXBC hash lookup
+
+Nsight's CLI hides the link between a PSO and the shader bytecode hashes
+it uses; this recovers it from the C++-Capture emitted source:
+
+```
+# After ngfx_cpp_capture_index_calls has written the .db,
+ngfx_pso_index(project_dir="C:/.../GeneratedCpp")
+# â†’ {shader_blob_count, pso_count, shader_format_histogram: {dxbc: N, spirv: M}, ...}
+
+ngfx_pso_get(
+    db_path="C:/.../GeneratedCpp/.ngfxmcp_cpp_calls.db",
+    pso_symbol="g_PSO_42",
+)
+# â†’ {pso_symbol, api: 'd3d12', creator: 'CreateGraphicsPipelineState',
+#    stages: {VS: {shader_symbol, hash_hex (DXBC MD5), format: 'dxbc', ...},
+#             PS: {...}}}
+
+# Reverse: given a hash from a perf tool / shader debugger,
+ngfx_pso_find_by_shader(db_path="...", hash_hex="aabbccdd...")
+# â†’ [{pso_symbol, stage, shader_symbol, api}, ...]
+```
+
+### 15. Browse the protobuf schema (RE-derived)
 
 ```
 ngfx_proto_search(pattern="RootParam")
@@ -583,6 +635,7 @@ src/nsight_graphics_mcp/
   proto_schemas.py       # name-only protobuf schema inventory
   proto_descriptors.py   # full FileDescriptorProto extraction â†’ DescriptorPool
   handle_resolver.py     # object handle â†’ create call + role-bucketed mentions
+  pso_resolver.py        # PSO â†’ DXBC/SPIR-V hash mapping (Nsight CLI gap)
   frame_costs.py         # Top-N by GPU time from perf-report dirs / gputrace zips
   objects.py             # object index (Resources / Pipelines pane parity)
   project.py             # .nsight-gfxproj XML authoring
@@ -606,216 +659,225 @@ docs/
 ## License
 
 MIT.
+
 ## Full tool reference
 
-Auto-generated from `server.py` docstrings (105 tools). Grouped by
-section comments in the source so the order roughly matches what
-you'd discover scrolling the file.
+Auto-generated from `server.py` docstrings. **110 tools** organised by
+the section comments in `server.py` â€” the order matches what you'd
+discover scrolling the file.
 
 ### environment + discovery
 
-- **`ngfx_environment`** — Report the resolved Nsight Graphics install + per-tool paths + cache dirs.
-- **`ngfx_list_installs`** — List every Nsight Graphics install detected on this machine.
-- **`ngfx_version`** — Return the version reported by ``ngfx.exe --version``.
-- **`ngfx_list_activities`** — List the activity names that ``ngfx.exe`` accepts (parsed from --help).
+- **`ngfx_environment`** â€” Report the resolved Nsight Graphics install + per-tool paths + cache dirs.
+- **`ngfx_list_installs`** â€” List every Nsight Graphics install detected on this machine.
+- **`ngfx_version`** â€” Return the version reported by ``ngfx.exe --version``.
+- **`ngfx_list_activities`** â€” List the activity names that ``ngfx.exe`` accepts (parsed from --help).
 
 ### Graphics Capture activity (via ngfx.exe)
 
-- **`ngfx_graphics_capture_launched`** — Run ``ngfx --activity 'Graphics Capture' --exe <exe> ...``.
-- **`ngfx_graphics_capture_attached`** — Same as ``ngfx_graphics_capture_launched`` but attaches to a running PID.
+- **`ngfx_graphics_capture_launched`** â€” Run ``ngfx --activity 'Graphics Capture' --exe <exe> ...``.
+- **`ngfx_graphics_capture_attached`** â€” Same as ``ngfx_graphics_capture_launched`` but attaches to a running PID.
 
 ### Headless Graphics Capture via ngfx-capture.exe
 
-- **`ngfx_capture_launched`** — Run ``ngfx-capture.exe`` directly (no Nsight UI required).
-- **`ngfx_capture_recapture`** — Recapture / recompress an existing ``.ngfx-gfxcap`` with the current format.
-- **`ngfx_capture_recompress`** — Recompress an existing capture without re-running the application.
+- **`ngfx_capture_launched`** â€” Run ``ngfx-capture.exe`` directly (no Nsight UI required).
+- **`ngfx_capture_recapture`** â€” Recapture / recompress an existing ``.ngfx-gfxcap`` with the current format.
+- **`ngfx_capture_recompress`** â€” Recompress an existing capture without re-running the application.
 
 ### Capture session management + metadata
 
-- **`ngfx_open_capture`** — Register a capture file path as a session handle.
-- **`ngfx_list_captures`** — List all opened capture sessions.
-- **`ngfx_close_capture`** — _(no docstring)_
-- **`ngfx_capture_summary`** — High-level summary of a capture (runs ``ngfx-replay --metadata``).
-- **`ngfx_capture_objects`** — Run ``ngfx-replay --metadata-objects``: full JSON list of every API object recorded in the capture (devices, queues, pipelines, resources...).
-- **`ngfx_capture_functions`** — Dump the recorded function stream (``ngfx-replay --metadata-functions``).
-- **`ngfx_capture_logs`** — Dump captured application/driver log messages embedded in the capture.
-- **`ngfx_capture_screenshot`** — Write the embedded final-present screenshot to a file.
+- **`ngfx_open_capture`** â€” Register a capture file path as a session handle.
+- **`ngfx_list_captures`** â€” List all opened capture sessions.
+- **`ngfx_close_capture`** â€” _(no docstring)_
+- **`ngfx_capture_summary`** â€” High-level summary of a capture (runs ``ngfx-replay --metadata``).
+- **`ngfx_capture_objects`** â€” Run ``ngfx-replay --metadata-objects``: full JSON list of every API object recorded in the capture (devices, queues, pipelines, resources...).
+- **`ngfx_capture_functions`** â€” Dump the recorded function stream (``ngfx-replay --metadata-functions``).
+- **`ngfx_capture_logs`** â€” Dump captured application/driver log messages embedded in the capture.
+- **`ngfx_capture_screenshot`** â€” Write the embedded final-present screenshot to a file.
 
 ### Replay (ngfx-replay.exe)
 
-- **`ngfx_replay_run`** — Replay a capture with ``ngfx-replay.exe`` and return its output.
-- **`ngfx_replay_bundle_extract`** — Extract a bundled-replayer capture's contents to a directory without running the replay.
-- **`ngfx_replay_metadata`** — Direct passthrough to ``ngfx-replay --metadata`` (parsed key/value).
+- **`ngfx_replay_run`** â€” Replay a capture with ``ngfx-replay.exe`` and return its output.
+- **`ngfx_replay_bundle_extract`** â€” Extract a bundled-replayer capture's contents to a directory without running the replay.
+- **`ngfx_replay_metadata`** â€” Direct passthrough to ``ngfx-replay --metadata`` (parsed key/value).
 
 ### GPU Trace Profiler
 
-- **`ngfx_gputrace_archs`** — Return the list of GPU architectures accepted by ``--architecture``.
-- **`ngfx_gputrace_launched`** — Run ``ngfx --activity 'GPU Trace Profiler' --exe <exe> ...``.
-- **`ngfx_gputrace_attached`** — Attach GPU Trace to a running process by PID. Defaults to hotkey-driven.
+- **`ngfx_gputrace_archs`** â€” Return the list of GPU architectures accepted by ``--architecture``.
+- **`ngfx_gputrace_launched`** â€” Run ``ngfx --activity 'GPU Trace Profiler' --exe <exe> ...``.
+- **`ngfx_gputrace_attached`** â€” Attach GPU Trace to a running process by PID. Defaults to hotkey-driven.
 
 ### GPU Trace report session management
 
-- **`ngfx_open_gputrace`** — Register a .nsight-gputrace path as a session handle.
-- **`ngfx_list_gputraces`** — _(no docstring)_
-- **`ngfx_close_gputrace`** — _(no docstring)_
-- **`ngfx_gputrace_inspect`** — Best-effort inspection of a ``.nsight-gputrace`` file.
+- **`ngfx_open_gputrace`** â€” Register a .nsight-gputrace path as a session handle.
+- **`ngfx_list_gputraces`** â€” _(no docstring)_
+- **`ngfx_close_gputrace`** â€” _(no docstring)_
+- **`ngfx_gputrace_inspect`** â€” Best-effort inspection of a ``.nsight-gputrace`` file.
 
 ### Generate C++ Capture activity
 
-- **`ngfx_cpp_capture_launched`** — Run ``ngfx --activity 'Generate C++ Capture' ...``.
+- **`ngfx_cpp_capture_launched`** â€” Run ``ngfx --activity 'Generate C++ Capture' ...``.
 
 ### OpenGL Frame Debugger
 
-- **`ngfx_framedebugger_launched`** — Run ``ngfx --activity 'OpenGL Frame Debugger' ...``.
+- **`ngfx_framedebugger_launched`** â€” Run ``ngfx --activity 'OpenGL Frame Debugger' ...``.
 
 ### Launch / background process management
 
-- **`ngfx_launch_status`** — Status + recent stdout/stderr of a background launch.
-- **`ngfx_list_launches`** — _(no docstring)_
-- **`ngfx_launch_stop`** — _(no docstring)_
+- **`ngfx_launch_status`** â€” Status + recent stdout/stderr of a background launch.
+- **`ngfx_list_launches`** â€” _(no docstring)_
+- **`ngfx_launch_stop`** â€” _(no docstring)_
 
 ### Remote monitor / RPC
 
-- **`ngfx_remote_monitor_start`** — Start ``nv-nsight-remote-monitor.exe`` headless on this machine so a remote Nsight UI can connect. Returns a launch handle — call ``ngfx_launch_stop`` to terminate it.
-- **`ngfx_rpc_start`** — Start ``ngfx-rpc.exe`` (the replayer UI server) headless.
+- **`ngfx_remote_monitor_start`** â€” Start ``nv-nsight-remote-monitor.exe`` headless on this machine so a remote Nsight UI can connect. Returns a launch handle â€” call ``ngfx_launch_stop`` to terminate it.
+- **`ngfx_rpc_start`** â€” Start ``ngfx-rpc.exe`` (the replayer UI server) headless.
 
 ### Aftermath (crash-dump tools)
 
-- **`ngfx_aftermath_control`** — Run ``nv-aftermath-control.exe`` with the provided args.
-- **`ngfx_aftermath_monitor_start`** — Start ``nv-aftermath-monitor.exe`` in the background to watch for GPU crashes / hangs and write dump files.
-- **`ngfx_aftermath_format`** — Run ``nv-aftermath-format.exe`` against an existing crash dump.
+- **`ngfx_aftermath_control`** â€” Run ``nv-aftermath-control.exe`` with the provided args.
+- **`ngfx_aftermath_monitor_start`** â€” Start ``nv-aftermath-monitor.exe`` in the background to watch for GPU crashes / hangs and write dump files.
+- **`ngfx_aftermath_format`** â€” Run ``nv-aftermath-format.exe`` against an existing crash dump.
 
 ### Layer install helpers
 
-- **`ngfx_layer_list`** — List the Vulkan / VulkanSC / OpenXR layer install scripts shipped with the Nsight Graphics install, and whether each one is present.
-- **`ngfx_layer_install`** — Run a Nsight Graphics layer install script.
+- **`ngfx_layer_list`** â€” List the Vulkan / VulkanSC / OpenXR layer install scripts shipped with the Nsight Graphics install, and whether each one is present.
+- **`ngfx_layer_install`** â€” Run a Nsight Graphics layer install script.
 
 ### NGFX SDK helpers (in-app integration)
 
-- **`ngfx_sdk_reference`** — Enumerate every header in the NGFX in-app SDK, with parsed function declarations (name, params, brief) for each.
-- **`ngfx_sdk_grep`** — Regex-search across the NGFX header tree (returns matched filename, line number, and matched line text).
-- **`ngfx_sdk_snippet`** — Generate a C++ integration snippet for an (activity, API) pair.
-- **`ngfx_sdk_header_text`** — Return the raw text of an NGFX SDK header.
+- **`ngfx_sdk_reference`** â€” Enumerate every header in the NGFX in-app SDK, with parsed function declarations (name, params, brief) for each.
+- **`ngfx_sdk_grep`** â€” Regex-search across the NGFX header tree (returns matched filename, line number, and matched line text).
+- **`ngfx_sdk_snippet`** â€” Generate a C++ integration snippet for an (activity, API) pair.
+- **`ngfx_sdk_header_text`** â€” Return the raw text of an NGFX SDK header.
 
 ### Escape hatch
 
-- **`ngfx_raw`** — Escape hatch — invoke any supported Nsight tool with arbitrary argv.
+- **`ngfx_raw`** â€” Escape hatch â€” invoke any supported Nsight tool with arbitrary argv.
 
 ### Capture-directory discovery + diff (parity with GUI 'Recent Captures')
 
-- **`ngfx_find_recent_captures`** — Look in the standard Nsight output directories (and optionally extra dirs) for recent capture / GPU-trace files. Newest first.
-- **`ngfx_list_captures_in_dir`** — Enumerate every capture / gputrace file under a directory.
-- **`ngfx_capture_diff`** — Diff the parsed ``--metadata`` summaries of two captures.
+- **`ngfx_find_recent_captures`** â€” Look in the standard Nsight output directories (and optionally extra dirs) for recent capture / GPU-trace files. Newest first.
+- **`ngfx_list_captures_in_dir`** â€” Enumerate every capture / gputrace file under a directory.
+- **`ngfx_capture_diff`** â€” Diff the parsed ``--metadata`` summaries of two captures.
 
 ### Function-stream indexer (Event List parity)
 
-- **`ngfx_index_events`** — Index a capture's function stream into a SQLite DB next to it.
-- **`ngfx_find_events`** — Filtered search over the indexed function stream.
-- **`ngfx_get_event`** — Look up a single call by index in the indexed function stream.
-- **`ngfx_event_histogram`** — Histogram of recorded calls grouped by ``name`` or ``kind``.
-- **`ngfx_find_calls_by_arg`** — Search recorded calls by argument substring.
+- **`ngfx_index_events`** â€” Index a capture's function stream into a SQLite DB next to it.
+- **`ngfx_find_events`** â€” Filtered search over the indexed function stream.
+- **`ngfx_get_event`** â€” Look up a single call by index in the indexed function stream.
+- **`ngfx_event_histogram`** â€” Histogram of recorded calls grouped by ``name`` or ``kind``.
+- **`ngfx_find_calls_by_arg`** â€” Search recorded calls by argument substring.
 
-### Object index (PSO / shader / resource inventory — GUI 'Resources' parity)
+### Object index (PSO / shader / resource inventory â€” GUI 'Resources' parity)
 
-- **`ngfx_index_objects`** — Index every API object recorded in a capture into a SQLite DB.
-- **`ngfx_query_objects`** — Filtered listing of recorded objects.
-- **`ngfx_get_object`** — Look up a single recorded object by uid.
-- **`ngfx_object_histogram`** — Histogram of recorded objects grouped by ``type_name``, ``category``, or ``api``.
-- **`ngfx_object_query`** — Read-only SQL (SELECT / WITH) against the object index.
-- **`ngfx_list_pipelines`** — List every Pipeline / PipelineLayout / DescriptorSetLayout / PipelineCache / RootSignature / StateObject in a capture.
-- **`ngfx_list_shaders`** — List every ShaderModule / ShaderProgram / Shader recorded in a capture.
-- **`ngfx_list_resources`** — List every recorded resource (Buffer / Image / Sampler / DeviceMemory / Heap).
-- **`ngfx_event_query`** — Read-only SQL query (SELECT / WITH) against the function index.
+- **`ngfx_index_objects`** â€” Index every API object recorded in a capture into a SQLite DB.
+- **`ngfx_query_objects`** â€” Filtered listing of recorded objects.
+- **`ngfx_get_object`** â€” Look up a single recorded object by uid.
+- **`ngfx_object_histogram`** â€” Histogram of recorded objects grouped by ``type_name``, ``category``, or ``api``.
+- **`ngfx_object_query`** â€” Read-only SQL (SELECT / WITH) against the object index.
+- **`ngfx_list_pipelines`** â€” List every Pipeline / PipelineLayout / DescriptorSetLayout / PipelineCache / RootSignature / StateObject in a capture.
+- **`ngfx_list_shaders`** â€” List every ShaderModule / ShaderProgram / Shader recorded in a capture.
+- **`ngfx_list_resources`** â€” List every recorded resource (Buffer / Image / Sampler / DeviceMemory / Heap).
+- **`ngfx_event_query`** â€” Read-only SQL query (SELECT / WITH) against the function index.
 
 ### Deep GPU Trace inspection (Trace Analysis parity)
 
-- **`ngfx_gputrace_archive`** — Open a .nsight-gputrace as a zip archive and list its members + decode any small JSON manifests inline.
-- **`ngfx_gputrace_read_member`** — Read a member of the .nsight-gputrace archive as UTF-8 text (no disk extraction). Auto-decodes JSON / CSV payloads.
-- **`ngfx_gputrace_extract`** — Extract a specific member of the .nsight-gputrace archive to ``out_dir``.
-- **`ngfx_list_perf_report`** — List the artifacts written by ``ngfx-replay --perf-report-dir``.
+- **`ngfx_gputrace_archive`** â€” Open a .nsight-gputrace as a zip archive and list its members + decode any small JSON manifests inline.
+- **`ngfx_gputrace_read_member`** â€” Read a member of the .nsight-gputrace archive as UTF-8 text (no disk extraction). Auto-decodes JSON / CSV payloads.
+- **`ngfx_gputrace_extract`** â€” Extract a specific member of the .nsight-gputrace archive to ``out_dir``.
+- **`ngfx_list_perf_report`** â€” List the artifacts written by ``ngfx-replay --perf-report-dir``.
 
 ### Nsight project file authoring
 
-- **`ngfx_project_create`** — Write a minimal Nsight project XML at ``path``.
-- **`ngfx_project_read`** — Read an existing Nsight project XML.
-- **`ngfx_project_update`** — Mutate fields of an existing Nsight project file in-place.
+- **`ngfx_project_create`** â€” Write a minimal Nsight project XML at ``path``.
+- **`ngfx_project_read`** â€” Read an existing Nsight project XML.
+- **`ngfx_project_update`** â€” Mutate fields of an existing Nsight project file in-place.
 
 ### C++ Capture build + run
 
-- **`ngfx_cpp_capture_find_solution`** — Locate the .sln produced by a Generate-C++-Capture run.
-- **`ngfx_cpp_capture_build`** — Invoke MSBuild on a Generate-C++-Capture output directory or .sln.
-- **`ngfx_cpp_capture_run`** — Run a Generate-C++-Capture exe to verify the repro still works.
-- **`ngfx_cpp_capture_open_in_ui`** — Open a saved capture in ``ngfx-ui.exe`` so the human can run the UI's *Generate C++ Capture* activity against it (the CLI activity can't, it requires the original application to re-launch).
-- **`ngfx_cpp_capture_wait_for_project`** — Poll ``watch_dir`` until a Generate-C++-Capture project lands and its .sln stops growing. Returns the project root + the solution path.
-- **`ngfx_cpp_capture_index_calls`** — Walk a Generate-C++-Capture project, parse every command-list / command-buffer call, and index them into SQLite for per-event queries.
-- **`ngfx_cpp_capture_event_args`** — Look up one C++-capture event by its synthetic ``event_index``.
-- **`ngfx_cpp_capture_query_calls`** — Filtered query against the indexed C++ call stream.
-- **`ngfx_cpp_capture_descriptor_bindings`** — Reconstruct the descriptor / root-parameter / vertex+index buffer / render-target binding state in effect at ``event_index`` by scanning backwards through the indexed C++ call stream.
-- **`ngfx_cpp_capture_sql`** — Read-only SELECT/WITH query against the C++ call index DB.
+- **`ngfx_cpp_capture_find_solution`** â€” Locate the .sln produced by a Generate-C++-Capture run.
+- **`ngfx_cpp_capture_build`** â€” Invoke MSBuild on a Generate-C++-Capture output directory or .sln.
+- **`ngfx_cpp_capture_run`** â€” Run a Generate-C++-Capture exe to verify the repro still works.
+- **`ngfx_cpp_capture_open_in_ui`** â€” Open a saved capture in ``ngfx-ui.exe`` so the human can run the UI's *Generate C++ Capture* activity against it (the CLI activity can't, it requires the original application to re-launch).
+- **`ngfx_cpp_capture_wait_for_project`** â€” Poll ``watch_dir`` until a Generate-C++-Capture project lands and its .sln stops growing. Returns the project root + the solution path.
+- **`ngfx_cpp_capture_index_calls`** â€” Walk a Generate-C++-Capture project, parse every command-list / command-buffer call, and index them into SQLite for per-event queries.
+- **`ngfx_cpp_capture_event_args`** â€” Look up one C++-capture event by its synthetic ``event_index``.
+- **`ngfx_cpp_capture_query_calls`** â€” Filtered query against the indexed C++ call stream.
+- **`ngfx_cpp_capture_descriptor_bindings`** â€” Reconstruct the descriptor / root-parameter / vertex+index buffer / render-target binding state in effect at ``event_index`` by scanning backwards through the indexed C++ call stream.
+- **`ngfx_cpp_capture_sql`** â€” Read-only SELECT/WITH query against the C++ call index DB.
 
 ### Shader compilation + Shader Debugger
 
-- **`ngfx_glslang_compile`** — Compile a GLSL / SPIR-V shader using ``glslang.exe`` (bundled).
-- **`ngfx_dxc_compile`** — Compile an HLSL shader via DXC.
-- **`ngfx_shaderdebugger_configure`** — Run ``nv-shaderdebugger-configurator.exe`` (use ``extra_args=['--help']`` to discover flags).
+- **`ngfx_glslang_compile`** â€” Compile a GLSL / SPIR-V shader using ``glslang.exe`` (bundled).
+- **`ngfx_dxc_compile`** â€” Compile an HLSL shader via DXC.
+- **`ngfx_shaderdebugger_configure`** â€” Run ``nv-shaderdebugger-configurator.exe`` (use ``extra_args=['--help']`` to discover flags).
 
 ### UI hand-off
 
-- **`ngfx_open_in_ui`** — Spawn ``ngfx-ui.exe`` to open a capture / gputrace / project file in the full Nsight Graphics UI.
+- **`ngfx_open_in_ui`** â€” Spawn ``ngfx-ui.exe`` to open a capture / gputrace / project file in the full Nsight Graphics UI.
 
 ### Capture watcher / wait-for-new-capture
 
-- **`ngfx_wait_for_new_capture`** — Poll one or more directories until a new capture (or GPU trace) lands, its size stabilises, then return its path.
+- **`ngfx_wait_for_new_capture`** â€” Poll one or more directories until a new capture (or GPU trace) lands, its size stabilises, then return its path.
 
 ### Doctor / health check + tool-help introspection
 
-- **`ngfx_doctor`** — One-shot health check: install discovery, every tool path, layer scripts, output-dir writability, ``nvidia-smi`` driver/GPU info, and the Vulkan implicit/explicit-layer registry. Reports a list of ``issues`` you should fix before running captures.
-- **`ngfx_tool_help`** — Run ``<tool> --help`` (or ``--help-all`` for ngfx) to discover the exact flags supported by your installed version of any Nsight binary.
+- **`ngfx_doctor`** â€” One-shot health check: install discovery, every tool path, layer scripts, output-dir writability, ``nvidia-smi`` driver/GPU info, and the Vulkan implicit/explicit-layer registry. Reports a list of ``issues`` you should fix before running captures.
+- **`ngfx_tool_help`** â€” Run ``<tool> --help`` (or ``--help-all`` for ngfx) to discover the exact flags supported by your installed version of any Nsight binary.
 
 ### Function-stream raw sample + cross-capture diff
 
-- **`ngfx_function_stream_sample`** — Return the first ``head`` (and optionally last ``tail``) raw lines of the recorded function stream.
-- **`ngfx_function_stream_diff`** — Diff the indexed function streams of two captures.
+- **`ngfx_function_stream_sample`** â€” Return the first ``head`` (and optionally last ``tail``) raw lines of the recorded function stream.
+- **`ngfx_function_stream_diff`** â€” Diff the indexed function streams of two captures.
 
 ### Triage macro
 
-- **`ngfx_capture_quick_triage`** — Run the full 'first look' pipeline on a capture in one call:
+- **`ngfx_capture_quick_triage`** â€” Run the full 'first look' pipeline on a capture in one call:
 
 ### Redistributables + registry
 
-- **`ngfx_list_d3d12_redist`** — List the bundled D3D12 Agility SDK redistributable shipped with Nsight Graphics. Pass ``preview=True`` for the preview SDK.
-- **`ngfx_list_runtime_dlls`** — List the runtime DLLs (DXC, DXIL, Aftermath, WinPixEventRuntime, DirectStorage, NGX/DLSS) bundled in the Nsight Graphics host bin dir.
-- **`ngfx_registry_restore`** — Run the bundled ``RegistryRestore.ps1`` to restore Nsight Graphics' registry keys to defaults.
+- **`ngfx_list_d3d12_redist`** â€” List the bundled D3D12 Agility SDK redistributable shipped with Nsight Graphics. Pass ``preview=True`` for the preview SDK.
+- **`ngfx_list_runtime_dlls`** â€” List the runtime DLLs (DXC, DXIL, Aftermath, WinPixEventRuntime, DirectStorage, NGX/DLSS) bundled in the Nsight Graphics host bin dir.
+- **`ngfx_registry_restore`** â€” Run the bundled ``RegistryRestore.ps1`` to restore Nsight Graphics' registry keys to defaults.
 
 ### Proto schema reference (extracted from ngfx-replay binary)
 
-- **`ngfx_proto_schemas`** — Return the protobuf schema inventory extracted from the Nsight binaries.
-- **`ngfx_proto_search`** — Regex-search the extracted protobuf schema for a name or FQN.
-- **`ngfx_proto_describe`** — Return the full field-level schema for a protobuf message extracted from Nsight's binaries.
-- **`ngfx_proto_list_messages`** — List every fully-qualified message name in the decoded schema pool.
-- **`ngfx_proto_extract_descriptors`** — Re-extract FileDescriptorProto blobs from a Nsight binary and rebuild the in-process schema registry.
+- **`ngfx_proto_schemas`** â€” Return the protobuf schema inventory extracted from the Nsight binaries.
+- **`ngfx_proto_search`** â€” Regex-search the extracted protobuf schema for a name or FQN.
+- **`ngfx_proto_describe`** â€” Return the full field-level schema for a protobuf message extracted from Nsight's binaries.
+- **`ngfx_proto_list_messages`** â€” List every fully-qualified message name in the decoded schema pool.
+- **`ngfx_proto_extract_descriptors`** â€” Re-extract FileDescriptorProto blobs from a Nsight binary and rebuild the in-process schema registry.
 
-### Capture diff — "git diff for captures"
+### Capture diff â€” "git diff for captures"
 
-- **`ngfx_event_stream_diff`** — Diff the per-event function streams of two captures (deeper than ``ngfx_capture_diff`` which only diffs the metadata summaries).
+- **`ngfx_event_stream_diff`** â€” Diff the per-event function streams of two captures (deeper than ``ngfx_capture_diff`` which only diffs the metadata summaries).
 
 ### Object handle / UID resolver
 
-- **`ngfx_resolve_handle`** — Look up an API object by uid or name, find its create call, and enumerate every C++-capture event that mentions it — bucketed by role (create / write / bind / draw / dispatch / barrier / destroy / other).
+- **`ngfx_resolve_handle`** â€” Look up an API object by uid or name, find its create call, and enumerate every C++-capture event that mentions it â€” bucketed by role (create / write / bind / draw / dispatch / barrier / destroy / other).
 
-### Frame cost analysis — top-N expensive draws/dispatches/regions
+### PSO â†’ DXBC / SPIR-V hash mapping
 
-- **`ngfx_top_n_costs`** — Return the top-N most expensive actions by GPU time across all CSVs in a ``ngfx-replay --perf-report-dir`` output, or a ``.nsight-gputrace`` archive.
+- **`ngfx_pso_index`** â€” Walk a Generate-C++-Capture project and index PSO â†’ shader-hash mappings into SQLite.
+- **`ngfx_pso_get`** â€” Look up one PSO's shader stages: each entry is ``{shader_symbol, format (dxbc/dxil/spirv), hash_hex, hash_source, declared_byte_count, head_hex}``.
+- **`ngfx_pso_list`** â€” List every indexed PSO with a one-line stage summary (``VS:g_VS_xxx, PS:g_PS_yyy``). Filter by ``api`` (``d3d12``/ ``vulkan``).
+- **`ngfx_pso_find_by_shader`** â€” Reverse lookup: which PSOs use a given shader? Supply EITHER the C-level shader symbol (e.g. ``g_VS_0x1234``) OR a DXBC/SPIR-V hash. Useful when a shader-debugger or perf trace gives you a hash and you want to know every PSO it's bound to.
+- **`ngfx_shader_blobs_list`** â€” List indexed shader bytecode blobs from a C++-Capture project. Filter by ``format`` (``dxbc``/``dxil``/``spirv``/``unknown``) and/or ``hash_hex`` (exact match).
+
+### Frame cost analysis â€” top-N expensive draws/dispatches/regions
+
+- **`ngfx_top_n_costs`** â€” Return the top-N most expensive actions by GPU time across all CSVs in a ``ngfx-replay --perf-report-dir`` output, or a ``.nsight-gputrace`` archive.
 
 ### Low-level capture-file inspection (RE-derived)
 
-- **`ngfx_capture_format_info`** — Structural inspection of a .ngfx-gfxcap file.
-- **`ngfx_capture_lz4_decompress`** — Experimental: attempt LZ4-block decompression of a byte range from a capture file. Useful for probing the chunk layout. Returns a hex preview of the decompressed bytes plus sizes; for unknown blocks, pass a generous ``uncompressed_size_hint`` (defaults to ``len(data) * 8``).
-- **`ngfx_decode_protobuf_wire`** — Experimental: decode a byte range as generic protobuf wire format.
+- **`ngfx_capture_format_info`** â€” Structural inspection of a .ngfx-gfxcap file.
+- **`ngfx_capture_lz4_decompress`** â€” Experimental: attempt LZ4-block decompression of a byte range from a capture file. Useful for probing the chunk layout. Returns a hex preview of the decompressed bytes plus sizes; for unknown blocks, pass a generous ``uncompressed_size_hint`` (defaults to ``len(data) * 8``).
+- **`ngfx_decode_protobuf_wire`** â€” Experimental: decode a byte range as generic protobuf wire format.
 
 ### Extra replay flags discovered via RE
 
-- **`ngfx_replay_screenshot`** — Replay a capture and dump per-frame screenshots to ``output_dir``.
-- **`ngfx_replay_gpu_frametimes`** — Replay a capture with GPU frametime collection enabled.
-- **`ngfx_replay_run_advanced`** — Run ``ngfx-replay`` with arbitrary flags discovered via reverse-engineering.
+- **`ngfx_replay_screenshot`** â€” Replay a capture and dump per-frame screenshots to ``output_dir``.
+- **`ngfx_replay_gpu_frametimes`** â€” Replay a capture with GPU frametime collection enabled.
+- **`ngfx_replay_run_advanced`** â€” Run ``ngfx-replay`` with arbitrary flags discovered via reverse-engineering.
 

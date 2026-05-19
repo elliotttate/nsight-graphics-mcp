@@ -56,6 +56,7 @@ from . import (
     project as project_mod,
     proto_descriptors,
     proto_schemas,
+    pso_resolver,
     redist as redist_mod,
     sdk,
     shaders as shaders_mod,
@@ -2715,6 +2716,110 @@ async def ngfx_resolve_handle(
         return {"ok": True, **result.to_dict()}
     except (FileNotFoundError, LookupError, ValueError) as exc:
         return {"ok": False, "error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# PSO → DXBC / SPIR-V hash mapping
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def ngfx_pso_index(
+    project_dir: str,
+    db_path: str | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Walk a Generate-C++-Capture project and index PSO → shader-hash
+    mappings into SQLite.
+
+    Nsight's CLI does NOT expose the PSO→DXBC-hash link in metadata. The
+    generated C++ does: shader bytecode is emitted as ``static const
+    unsigned char g_<name>[] = { ... };`` arrays, and PSO creation calls
+    reference those byte-array symbols (D3D12) or vkCreateShaderModule
+    handles (Vulkan).
+
+    This parses both, hashes blobs (DXBC: built-in MD5 from the container
+    bytes 4..20; SPIR-V: SHA-1 of the full blob), and writes two tables
+    alongside the existing C++-Capture index DB::
+
+        shader_blobs(symbol, format, hash_hex, hash_source,
+                     declared_byte_count, file_path, line_number, head_hex)
+        pso_shaders(pso_symbol, stage, shader_symbol, api, creator,
+                    file_path, line_number)
+
+    Run this AFTER ``ngfx_cpp_capture_index_calls`` against the same
+    project dir — both tables coexist in the same .db file.
+    """
+    return pso_resolver.index_project_psos(
+        Path(project_dir),
+        db_path=Path(db_path) if db_path else None,
+        force=force,
+    )
+
+
+@mcp.tool()
+async def ngfx_pso_get(db_path: str, pso_symbol: str) -> dict[str, Any]:
+    """Look up one PSO's shader stages: each entry is ``{shader_symbol,
+    format (dxbc/dxil/spirv), hash_hex, hash_source, declared_byte_count,
+    head_hex}``.
+
+    The DXBC hash is the 128-bit MD5 baked into the DXBC container by the
+    Microsoft compiler — the same bytes Nsight / PIX / RenderDoc display
+    as the shader identity. For SPIR-V, ``hash_hex`` is SHA-1 of the blob.
+    """
+    rec = pso_resolver.get_pso(Path(db_path), pso_symbol)
+    if rec is None:
+        return {"ok": False, "error": f"PSO {pso_symbol!r} not in index"}
+    return {"ok": True, **rec}
+
+
+@mcp.tool()
+async def ngfx_pso_list(
+    db_path: str,
+    api: str | None = None,
+    limit: int = 500,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """List every indexed PSO with a one-line stage summary
+    (``VS:g_VS_xxx, PS:g_PS_yyy``). Filter by ``api`` (``d3d12``/
+    ``vulkan``)."""
+    rows = pso_resolver.list_psos(Path(db_path), api=api, limit=limit, offset=offset)
+    return {"ok": True, "psos": rows, "count": len(rows)}
+
+
+@mcp.tool()
+async def ngfx_pso_find_by_shader(
+    db_path: str,
+    shader_symbol: str | None = None,
+    hash_hex: str | None = None,
+) -> dict[str, Any]:
+    """Reverse lookup: which PSOs use a given shader? Supply EITHER the
+    C-level shader symbol (e.g. ``g_VS_0x1234``) OR a DXBC/SPIR-V hash.
+    Useful when a shader-debugger or perf trace gives you a hash and you
+    want to know every PSO it's bound to."""
+    try:
+        rows = pso_resolver.find_psos_using_shader(
+            Path(db_path), shader_symbol=shader_symbol, hash_hex=hash_hex,
+        )
+        return {"ok": True, "pso_references": rows, "count": len(rows)}
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@mcp.tool()
+async def ngfx_shader_blobs_list(
+    db_path: str,
+    format: str | None = None,
+    hash_hex: str | None = None,
+    limit: int = 500,
+) -> dict[str, Any]:
+    """List indexed shader bytecode blobs from a C++-Capture project.
+    Filter by ``format`` (``dxbc``/``dxil``/``spirv``/``unknown``) and/or
+    ``hash_hex`` (exact match)."""
+    rows = pso_resolver.list_shader_blobs(
+        Path(db_path), format=format, hash_hex=hash_hex, limit=limit,
+    )
+    return {"ok": True, "blobs": rows, "count": len(rows)}
 
 
 # ---------------------------------------------------------------------------
