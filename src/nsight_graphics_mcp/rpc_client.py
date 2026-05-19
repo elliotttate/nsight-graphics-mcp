@@ -247,79 +247,82 @@ class RpcTransport:
 # (the simplest possibility) — flip ``RpcMessageHeader.WIRE_LAYOUT`` to
 # experiment with other encodings.
 
-#: Total in-memory size of the C++ MessageHeader as observed in the binary
-#: (offset 0 .. 60 from ``hdr_init__sub_140985480`` which zero-fills bytes
-#: 0..60 inclusive).
+#: Wire-format MessageHeader size — recovered from
+#: ``sub_140983400`` which rejects frames where ``end - start < 0x18``
+#: with the log "Message buffer is too small, less than wire format header size".
+MESSAGE_HEADER_WIRE_SIZE = 24
+
+#: In-memory C++ struct size — distinct from the wire size. The C++ side
+#: keeps a 60-byte struct internally but serialises it down to 24 bytes
+#: on the wire via ``sub_1409854C0`` / ``sub_140985580``.
 MESSAGE_HEADER_IN_MEM_SIZE = 60
 
 
 @dataclass
 class RpcMessageHeader:
-    """The C++ ``NV::TPS::MessageHeader`` mirror.
+    """C++ ``NV::TPS::MessageHeader`` — 24 bytes on the wire.
 
-    Field offsets confirmed from binary:
-      * +0  is_valid (u8)         — checked by ``sub_1409216C0`` (the
-                                    main dispatcher's validity gate)
-      * +2  is_valid (u8)         — checked by ``hdr_is_valid``
-                                    (``sub_140985570``)
-      * +32 category (u32)        — global category enum, read via
-                                    ``hdr_get_category`` (``sub_1409854B0``)
-      * +36 method   (u32)        — method id, ``hdr_get_method``
-                                    (``sub_140985560``)
-      * +48 ticket_id (u64)       — request/response correlation
-      * +56 sertype  (u32)        — serialization format,
-                                    ``hdr_get_sertype`` (``sub_140985540``)
+    Wire layout recovered from ``sub_1409854C0`` (deserializer, wire→mem)
+    and ``sub_140985580`` (serializer, mem→wire). Both functions agree::
 
-    All other bytes are zero by default. NOTE: setting both is_valid
-    bytes correctly is NECESSARY but apparently not sufficient — live
-    probes against a TCP-mode server still drop the frame. See
-    ``docs/RPC_PROTOCOL.md`` for the unresolved unknowns.
+        wire bytes        in-mem offset (60-byte struct)
+        [0..8]   u64 BE   ticket_id  → +8
+        [8..16]  u64 BE   request_id → +16  (conditional: only if nonzero,
+                                              also sets mem[+1] = 1)
+        [16..20] u32 BE   ??? (seq?) → +24
+        [20]     u8       category   → +32 (zero-extended to u32)
+        [21]     u8       method     → +36 (zero-extended to u32)
+        [22]     u8       slot/flag  → +40 (zero-extended to u32)
+        [23] bit0         is_valid_2 → +2
+        [23] bit1         sertype    → +56
+
+    So category and method are single BYTES on the wire (matching the
+    proto enums — BinaryReplayMethod has 110 entries, well under 256).
+    The previous 60-byte raw-struct dump was the in-memory shape, NOT
+    the wire shape — which is why the server dropped every probe.
+
+    NOTE: ``is_valid`` at wire byte 23 bit 0 is set automatically when
+    serialising; the caller doesn't need to manage it.
     """
 
     category: int
     method: int
     ticket_id: int = 0
     sertype: int = 0
-    is_valid: int = 1
-
-    # Layout selector for experimentation. Currently the only implemented
-    # layout is "raw_struct" (a 60-byte little-endian blob). If RE later
-    # shows the wire format is protobuf or length-prefixed, add new
-    # encoders here and switch ``WIRE_LAYOUT``.
-    WIRE_LAYOUT: str = field(default="raw_struct", init=False, repr=False)
+    request_id: int = 0       # the conditional u64 at wire [8..16]
+    seq: int = 0              # the u32 at wire [16..20] — purpose unknown
+    slot: int = 0             # the u8 at wire [22] — purpose unknown
 
     def pack(self) -> bytes:
-        if self.WIRE_LAYOUT != "raw_struct":
-            raise NotImplementedError(self.WIRE_LAYOUT)
-        buf = bytearray(MESSAGE_HEADER_IN_MEM_SIZE)
-        # ``is_valid`` lives at TWO offsets:
-        #   * byte +0  — checked by ``sub_1409216C0`` (= ``return *a1``)
-        #     in the main dispatcher path
-        #   * byte +2  — checked by ``hdr_is_valid`` (``sub_140985570``)
-        # Set BOTH so neither path rejects us. Discovered by ground-truth
-        # decompile of sub_1409216C0 vs sub_140985570; the previous client
-        # version only set +2 and the dispatcher silently dropped the frame.
-        buf[0] = self.is_valid & 0xFF
-        buf[2] = self.is_valid & 0xFF
-        struct.pack_into("<I", buf, 32, self.category & 0xFFFFFFFF)
-        struct.pack_into("<I", buf, 36, self.method & 0xFFFFFFFF)
-        struct.pack_into("<Q", buf, 48, self.ticket_id & 0xFFFFFFFFFFFFFFFF)
-        struct.pack_into("<I", buf, 56, self.sertype & 0xFFFFFFFF)
+        """Emit the 24-byte wire encoding (NOT the 60-byte in-mem struct)."""
+        buf = bytearray(MESSAGE_HEADER_WIRE_SIZE)
+        struct.pack_into(">Q", buf, 0,  self.ticket_id & 0xFFFFFFFFFFFFFFFF)
+        struct.pack_into(">Q", buf, 8,  self.request_id & 0xFFFFFFFFFFFFFFFF)
+        struct.pack_into(">I", buf, 16, self.seq & 0xFFFFFFFF)
+        buf[20] = self.category & 0xFF
+        buf[21] = self.method & 0xFF
+        buf[22] = self.slot & 0xFF
+        # byte 23: bit 0 = is_valid (always 1 for outgoing), bit 1 = sertype LSB
+        buf[23] = 0x01 | ((self.sertype & 0x01) << 1)
         return bytes(buf)
 
     @classmethod
     def unpack(cls, b: bytes) -> "RpcMessageHeader":
-        if len(b) < MESSAGE_HEADER_IN_MEM_SIZE:
+        if len(b) < MESSAGE_HEADER_WIRE_SIZE:
             raise RpcProtocolError(
-                f"message header too short: {len(b)} < {MESSAGE_HEADER_IN_MEM_SIZE}"
+                f"wire header too short: {len(b)} < {MESSAGE_HEADER_WIRE_SIZE}"
             )
-        is_valid = b[2]
-        category = struct.unpack_from("<I", b, 32)[0]
-        method = struct.unpack_from("<I", b, 36)[0]
-        ticket_id = struct.unpack_from("<Q", b, 48)[0]
-        sertype = struct.unpack_from("<I", b, 56)[0]
+        ticket_id = struct.unpack_from(">Q", b, 0)[0]
+        request_id = struct.unpack_from(">Q", b, 8)[0]
+        seq = struct.unpack_from(">I", b, 16)[0]
+        category = b[20]
+        method = b[21]
+        slot = b[22]
+        flags = b[23]
+        sertype = (flags >> 1) & 1
+        # is_valid is implicit (always 1 for accepted frames)
         return cls(category=category, method=method, ticket_id=ticket_id,
-                   sertype=sertype, is_valid=is_valid)
+                   sertype=sertype, request_id=request_id, seq=seq, slot=slot)
 
 
 @dataclass
@@ -335,7 +338,7 @@ class RpcMessage:
     @classmethod
     def unpack(cls, b: bytes) -> "RpcMessage":
         hdr = RpcMessageHeader.unpack(b)
-        return cls(header=hdr, body=b[MESSAGE_HEADER_IN_MEM_SIZE:])
+        return cls(header=hdr, body=b[MESSAGE_HEADER_WIRE_SIZE:])
 
 
 # ---------------------------------------------------------------------------

@@ -232,6 +232,69 @@ The Python client in
   `root_parameters`, `descriptor_state`). These will start working as
   soon as `RpcMessageHeader.pack()` produces the correct wire bytes.
 
+## ✅ MessageHeader wire format — DECODED
+
+**Update 2026-05-19:** the previous "raw 60-byte struct dump" hypothesis
+was wrong. The C++ side maintains a 60-byte in-memory header, but
+serialises it down to a **compact 24-byte wire encoding** via
+`sub_140985580` (mem→wire) / `sub_1409854C0` (wire→mem). The wire size
+is hard-confirmed by `sub_140983400` which rejects frames where
+`buffer_end - buffer_start < 0x18` with the log message
+*"Message buffer is too small, less than wire format header size"*.
+
+```
+wire offset  size  type    field        in-mem offset (60-byte struct)
+[0..8]       8     u64 BE  ticket_id    +8
+[8..16]      8     u64 BE  request_id   +16    (only set when nonzero;
+                                                also sets mem[+1] = 1)
+[16..20]     4     u32 BE  seq          +24    (purpose unknown)
+[20]         1     u8      category     +32    (zero-extended to u32)
+[21]         1     u8      method       +36    (zero-extended to u32)
+[22]         1     u8      slot/flag    +40    (zero-extended to u32)
+[23]         1     u8      flags        — bit 0 = is_valid; bit 1 = sertype LSB
+```
+
+So **category and method are single bytes** on the wire — matching the
+proto enum sizes (BinaryReplayMethod has 110 entries, well under 256).
+ticket_id and request_id are big-endian u64 (matches the transport-
+level `body_size` which is also BE).
+
+The Python encoder in `RpcMessageHeader.pack()` now produces this layout.
+
+### Verified live round-trip (2026-05-19)
+
+With the corrected wire format, the first probe finally got a reply:
+
+**Sent** (34 wire bytes — 8 transport + 24 header + 2 protobuf body):
+```
+54 08 00 00 00 00 00 1a   transport: T 08 ch=0 flag=0 size_BE=26
+00 00 00 00 00 00 00 01   ticket_id BE = 1
+00 00 00 00 00 00 00 00   request_id BE = 0
+00 00 00 00               seq BE = 0
+02 01 00 01               category=2 method=1 slot=0 flags=0x01(valid)
+08 01                     PbHandshakeBeginMessage(id=1)
+```
+
+**Received** (32 bytes — 8 transport + 24 header reply, no body):
+```
+54 08 00 00 00 00 00 18   transport: T 08 ch=0 flag=0 size_BE=24
+00 00 00 00 00 00 00 01   ticket_id BE = 1  ← correlates with our request!
+00 00 00 00 00 00 00 01   request_id BE = 1
+00 00 00 00               seq BE = 0
+00 00 0b 00               category=0 method=0 slot=0x0b flags=0x00
+```
+
+The server received our frame, parsed it, correlated the response by
+ticket_id, and replied. The reply body is empty — likely because we
+guessed wrong on the (category=2, method=1) for the handshake, but the
+underlying transport + header now works end-to-end.
+
+**Next iteration:** determine which (category, method) actually triggers
+a meaningful handshake. The `BinaryReplayMethod` proto enum gives 110
+method ids; the categories table seems to be `(1=Diagnostics, ...)` per
+the recv-pinger constants. Trying `method=14 (EventInfo)` or
+`method=8 (Metadata)` against `category=1` is the natural next step.
+
 ## Sample bytes — the current send attempt (verified emit)
 
 Actual bytes our client emits, freshly measured (the earlier "size=74"

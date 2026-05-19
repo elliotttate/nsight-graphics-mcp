@@ -31,7 +31,7 @@ from nsight_graphics_mcp.rpc_client import (
     FRAME_HEADER_SIZE,
     FRAME_MAGIC_0,
     FRAME_MAGIC_1,
-    MESSAGE_HEADER_IN_MEM_SIZE,
+    MESSAGE_HEADER_WIRE_SIZE,
     RpcMessage,
     RpcMessageHeader,
     RpcProtocolError,
@@ -82,43 +82,54 @@ def test_transport_frame_unpack_header_validates_length() -> None:
         TransportFrame.unpack_header(b"\x54\x08\x00")  # too short
 
 
-def test_rpc_message_header_raw_struct_layout() -> None:
-    hdr = RpcMessageHeader(category=7, method=33, ticket_id=12345, sertype=2)
+def test_rpc_message_header_wire_layout() -> None:
+    """Pack/unpack round-trips the verified 24-byte wire layout. Field
+    placements come from ``sub_1409854C0`` (deserializer) and
+    ``sub_140985580`` (serializer) in ngfx-rpc.exe; ticket_id and
+    request_id are u64 BE, category/method/slot are single bytes."""
+    hdr = RpcMessageHeader(category=7, method=33, ticket_id=12345, sertype=1,
+                           request_id=0xDEADBEEF, seq=0xCAFE, slot=11)
     packed = hdr.pack()
-    assert len(packed) == MESSAGE_HEADER_IN_MEM_SIZE == 60
+    assert len(packed) == MESSAGE_HEADER_WIRE_SIZE == 24
 
-    # is_valid byte
-    assert packed[2] == 1
-    # category at offset 32, little-endian u32
-    assert struct.unpack_from("<I", packed, 32)[0] == 7
-    # method at offset 36
-    assert struct.unpack_from("<I", packed, 36)[0] == 33
-    # ticket_id at offset 48, little-endian u64
-    assert struct.unpack_from("<Q", packed, 48)[0] == 12345
-    # sertype at offset 56
-    assert struct.unpack_from("<I", packed, 56)[0] == 2
+    # ticket_id at wire bytes 0..8, BIG-endian
+    assert struct.unpack_from(">Q", packed, 0)[0] == 12345
+    # request_id at wire bytes 8..16, BIG-endian
+    assert struct.unpack_from(">Q", packed, 8)[0] == 0xDEADBEEF
+    # seq at wire bytes 16..20, BIG-endian u32
+    assert struct.unpack_from(">I", packed, 16)[0] == 0xCAFE
+    # category/method/slot are single bytes at +20/+21/+22
+    assert packed[20] == 7
+    assert packed[21] == 33
+    assert packed[22] == 11
+    # byte 23: bit 0 = is_valid (always 1 outgoing), bit 1 = sertype
+    assert packed[23] & 0x01 == 1
+    assert (packed[23] >> 1) & 0x01 == 1
 
     # round-trip
     parsed = RpcMessageHeader.unpack(packed)
     assert parsed.category == 7
     assert parsed.method == 33
     assert parsed.ticket_id == 12345
-    assert parsed.sertype == 2
-    assert parsed.is_valid == 1
+    assert parsed.request_id == 0xDEADBEEF
+    assert parsed.seq == 0xCAFE
+    assert parsed.slot == 11
+    assert parsed.sertype == 1
 
 
-def test_rpc_message_pack_concatenates_header_and_body() -> None:
+def test_rpc_message_pack_concatenates_wire_header_and_body() -> None:
     hdr = RpcMessageHeader(category=1, method=2, ticket_id=3)
     body = b"\x08\x01"
     msg = RpcMessage(header=hdr, body=body)
     packed = msg.pack()
-    assert len(packed) == MESSAGE_HEADER_IN_MEM_SIZE + len(body)
+    assert len(packed) == MESSAGE_HEADER_WIRE_SIZE + len(body)
     assert packed[-2:] == body
 
 
 def test_rpc_message_unpack_short_body_raises() -> None:
     with pytest.raises(RpcProtocolError):
-        RpcMessage.unpack(b"\x00" * 30)  # less than 60
+        # Anything under 24 bytes is too short for the wire header.
+        RpcMessage.unpack(b"\x00" * 16)
 
 
 def test_transport_frame_unpack_round_trip_via_socket_pair() -> None:
