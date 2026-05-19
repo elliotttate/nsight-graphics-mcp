@@ -38,6 +38,10 @@ coverage.xml
 *.ngfxmcp/
 .ngfxmcp_cpp_calls.db
 
+# RE scratch artifacts (IDA scripts + decompiled function dumps)
+ida_rpc/
+ida_*/
+
 # --- OS ---
 .DS_Store
 Thumbs.db

@@ -17,6 +17,9 @@ Surface area:
 * ``ngfx_aftermath_*`` — Aftermath crash-dump configuration + monitoring.
 * ``ngfx_remote_monitor_*`` — start/stop the remote-monitor headless daemon.
 * ``ngfx_rpc_start`` — start the headless RPC server.
+* ``ngfx_rpc_protocol_info`` — reverse-engineered wire-format spec.
+* ``ngfx_rpc_transport_connect`` / ``ngfx_rpc_send_raw_frame`` — low-level
+  RPC transport (8-byte ``[magic][channel][flag][size_BE]`` framing).
 * ``ngfx_layer_*`` — Vulkan / VulkanSC / OpenXR layer install helpers.
 * ``ngfx_sdk_*`` — header inventory, regex search, and codegen for the
   in-app NGFX SDK.
@@ -1253,6 +1256,167 @@ async def ngfx_rpc_start(
         bg, tool="ngfx-rpc", notes=f"RPC server, transport={transport}"
     )
     return sess.summary()
+
+
+@mcp.tool()
+async def ngfx_rpc_protocol_info() -> dict[str, Any]:
+    """Return everything we know about the ``ngfx-rpc.exe`` custom wire
+    protocol — handy as a self-describing reference for callers writing
+    their own clients. The full derivation lives in
+    ``docs/RPC_PROTOCOL.md`` (in this repo).
+
+    The transport-layer 8-byte framing is fully verified; the per-message
+    ``MessageHeader`` wire layout is still being validated live (the
+    in-memory layout is exact but the on-wire encoding may differ).
+    """
+    from . import rpc_client as rc
+
+    try:
+        reg = proto_descriptors.get_registry()
+        # build a list of category enums + their methods straight from
+        # the embedded protos
+        method_enums: dict[str, list[dict[str, int]]] = {}
+        for fname, fd in reg.files.items():
+            for et in fd.enum_type:
+                if "Method" in et.name:
+                    method_enums[f"{fname}::{et.name}"] = [
+                        {"name": v.name, "number": v.number} for v in et.value
+                    ]
+    except Exception as e:
+        method_enums = {"error": str(e)}
+
+    return {
+        "transport_frame_header": {
+            "size_bytes": rc.FRAME_HEADER_SIZE,
+            "layout": "[u8 magic0][u8 magic1][u8 channelId][u8 flag][u32 size_BE]",
+            "magic_bytes": [rc.FRAME_MAGIC_0, rc.FRAME_MAGIC_1],
+            "endianness": "size is big-endian (network byte order); other "
+                          "fields are byte-stream order",
+            "verified": True,
+        },
+        "dispatch": {
+            "key": "(category u32, method u32)",
+            "category_id_pins": {
+                "Diagnostics": 1,
+            },
+            "category_id_conjecture": {
+                "Handshake": 2,
+                "Connection": 3,
+                "Discovery": 4,
+                "DeviceInfo": 5,
+                "SystemInfo": 6,
+                "BinaryReplay": 7,
+                "WarpViz": 8,
+            },
+            "method_enums_in_proto": method_enums,
+        },
+        "message_header_in_mem": {
+            "size_bytes": rc.MESSAGE_HEADER_IN_MEM_SIZE,
+            "fields": [
+                {"offset": 2, "type": "u8", "name": "is_valid"},
+                {"offset": 32, "type": "u32", "name": "category"},
+                {"offset": 36, "type": "u32", "name": "method"},
+                {"offset": 48, "type": "u64", "name": "ticket_id"},
+                {"offset": 56, "type": "u32", "name": "sertype"},
+            ],
+            "wire_layout_implemented": rc.RpcMessageHeader.WIRE_LAYOUT,
+            "wire_layout_verified": False,
+            "note": "see docs/RPC_PROTOCOL.md — the wire encoding of the "
+                    "MessageHeader is still being disambiguated against "
+                    "the live server.",
+        },
+        "session_model": {
+            "tcp": "single-shot: server exits when the client TCP "
+                   "session closes",
+            "named_pipe": "auto-rearms: server stays alive across "
+                          "consecutive clients (string evidence: "
+                          "'AsioFeatureServer received session closed. "
+                          "Setup named pipe again.')",
+        },
+        "auth_env_vars": [
+            "NV_TPS_LAUNCH_TOKEN",
+            "NV_TPS_LAUNCH_UUID",
+            "NV_TPS_LAUNCH_ENV_HASH",
+        ],
+    }
+
+
+@mcp.tool()
+async def ngfx_rpc_transport_connect(
+    host: str = "127.0.0.1",
+    port: int = 0,
+    pid: int | None = None,
+    timeout_sec: float = 5.0,
+) -> dict[str, Any]:
+    """Open one TCP transport connection to a running ``ngfx-rpc.exe`` and
+    immediately close it. Useful as a smoke test: it verifies the server
+    is reachable and that the 8-byte frame magic checks out.
+
+    Provide either ``port`` directly, or ``pid`` (the tool will enumerate
+    the listening TCP port for that pid).
+    """
+    from . import rpc_client as rc
+
+    if pid is not None and port == 0:
+        try:
+            port = rc.find_listening_port(int(pid), timeout=timeout_sec)
+        except TimeoutError as e:
+            return {"ok": False, "error": str(e), "pid": pid}
+
+    if port <= 0:
+        return {"ok": False, "error": "neither port nor pid provided"}
+
+    try:
+        with rc.RpcTransport.connect(host, port, timeout=timeout_sec) as _t:
+            pass
+        return {"ok": True, "host": host, "port": port,
+                "note": "connection established; transport-layer ready"}
+    except Exception as e:
+        return {"ok": False, "host": host, "port": port,
+                "error": f"{type(e).__name__}: {e}"}
+
+
+@mcp.tool()
+async def ngfx_rpc_send_raw_frame(
+    host: str,
+    port: int,
+    channel: int = 0,
+    body_hex: str = "",
+    expect_reply: bool = True,
+    timeout_sec: float = 3.0,
+) -> dict[str, Any]:
+    """Low-level escape hatch: send one transport frame and (optionally)
+    await one reply frame. Useful for protocol RE work.
+
+    ``body_hex`` is the frame body as a hex string (no ``0x`` prefix,
+    spaces allowed).
+    """
+    from . import rpc_client as rc
+
+    body = bytes.fromhex(body_hex.replace(" ", ""))
+    try:
+        with rc.RpcTransport.connect(host, port, timeout=timeout_sec) as t:
+            t.send_frame(rc.TransportFrame(channel=channel, body=body))
+            sent = {"bytes_sent": rc.FRAME_HEADER_SIZE + len(body)}
+            if not expect_reply:
+                return {"ok": True, **sent, "reply": None}
+            reply = t.recv_frame()
+            return {
+                "ok": True,
+                **sent,
+                "reply": {
+                    "channel": reply.channel,
+                    "flag": reply.flag,
+                    "body_size": len(reply.body),
+                    "body_hex": reply.body.hex(),
+                    "body_preview_ascii": "".join(
+                        chr(b) if 32 <= b < 127 else "." for b in reply.body[:128]
+                    ),
+                },
+            }
+    except Exception as e:
+        return {"ok": False, "host": host, "port": port,
+                "error": f"{type(e).__name__}: {e}"}
 
 
 # ---------------------------------------------------------------------------

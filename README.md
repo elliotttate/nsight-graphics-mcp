@@ -128,6 +128,55 @@ per-record layout of FunctionInfo is the remaining RE work for direct
 arg extraction. Until that's done, use the C++-Capture roundtrip path
 above for arg-level queries.
 
+### ngfx-rpc custom transport client (RE-derived, partial)
+
+`ngfx-rpc.exe` is the "Replayer UI Server" — a long-running process the
+Nsight UI connects to over TCP / named-pipe / domain-socket. It speaks
+a **custom length-prefixed protobuf protocol** (not standard gRPC, even
+though its 30 .proto files contain ~50 `Request`/`Reply` message pairs
+that look gRPC-shaped). The transport layer is fully decoded; the
+per-message header encoding is decoded statically but not yet verified
+over a live round-trip (see caveat below).
+
+**Wire format (verified):**
+
+```
+byte 0   = 0x54 ('T')   magic
+byte 1   = 0x08         magic
+byte 2   = channel_id   u8
+byte 3   = 0x00         flag/padding
+byte 4-7 = body_size    u32 BIG-ENDIAN
+byte 8+  = body (length = body_size)
+```
+
+**Dispatch model:** `(category u32, method u32)` keyed 2-D handler table.
+Method enums (already in the proto pool) include `BinaryReplayMethod`
+with 110 entries — `MethodApiInspectorStateRequest=33`,
+`MethodRootParametersRequest=67`, etc. Category id `1 = Diagnostics`.
+
+| Tool | What it does |
+| --- | --- |
+| `ngfx_rpc_protocol_info` | Return the decoded transport spec + the in-process method-enum tables (no live connection needed). |
+| `ngfx_rpc_transport_connect` | Open a TCP / named-pipe / domain-socket connection to a running `ngfx-rpc.exe` and return a session handle. |
+| `ngfx_rpc_send_raw_frame` | Send an arbitrary framed message and read the reply — escape hatch for experimenting with the protocol. |
+
+**Caveat (live-round-trip work in progress).** ngfx-rpc's TCP server is
+one-shot: it exits the moment the first client session ends. That makes
+iterative "guess header → observe reply" probing impractical (the first
+attempt at the most-likely `MessageHeader` layout crashes the server,
+and relaunching takes ~30s). The structural header layout was recovered
+statically from IDA (`is_valid u8@+2, category u32@+32, method u32@+36,
+ticket_id u64@+48, sertype u32@+56`, 60 bytes total) but isn't yet
+confirmed on-wire. The two remaining angles are:
+
+1. **`pktmon` capture of a real ngfx-ui ↔ ngfx-rpc exchange** — the
+   schema pool decodes every observed message; recovers handshake +
+   real method calls by observation.
+2. **IDA on `NV::TPS::ProtoBufMessage::Serialize`** — read the exact
+   serialiser bytes the C++ side emits.
+
+Both are documented in `docs/RPC_PROTOCOL.md`.
+
 ### Capture session management + inspection
 
 | Tool | What it answers |
@@ -332,7 +381,7 @@ index, and (when present) the C++-Capture index.
 
 ## How big is the surface?
 
-**116 MCP tools** as of this writing, grouped by the sections below.
+**119 MCP tools** as of this writing, grouped by the sections below.
 Run `nsight-graphics-mcp --list-tools` (or import the package and inspect
 `server`) for an up-to-date enumeration.
 
@@ -693,7 +742,7 @@ MIT.
 
 ## Full tool reference
 
-Auto-generated from `server.py` docstrings. **116 tools** organised by
+Auto-generated from `server.py` docstrings. **119 tools** organised by
 the section comments in `server.py` — the order matches what you'd
 discover scrolling the file.
 
@@ -763,6 +812,9 @@ discover scrolling the file.
 
 - **`ngfx_remote_monitor_start`** — Start ``nv-nsight-remote-monitor.exe`` headless on this machine so a remote Nsight UI can connect. Returns a launch handle — call ``ngfx_launch_stop`` to terminate it.
 - **`ngfx_rpc_start`** — Start ``ngfx-rpc.exe`` (the replayer UI server) headless.
+- **`ngfx_rpc_protocol_info`** — Return everything we know about the ``ngfx-rpc.exe`` custom wire protocol — handy as a self-describing reference for callers writing their own clients. The full derivation lives in ``docs/RPC_PROTOCOL.md`` (in this repo).
+- **`ngfx_rpc_transport_connect`** — Open one TCP transport connection to a running ``ngfx-rpc.exe`` and immediately close it. Useful as a smoke test: it verifies the server is reachable and that the 8-byte frame magic checks out.
+- **`ngfx_rpc_send_raw_frame`** — Low-level escape hatch: send one transport frame and (optionally) await one reply frame. Useful for protocol RE work.
 
 ### Aftermath (crash-dump tools)
 
