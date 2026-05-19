@@ -47,6 +47,13 @@ def test_tool_registration() -> None:
         "ngfx_sdk_snippet",
         "ngfx_layer_install",
         "ngfx_raw",
+        # direct capture decoder
+        "ngfx_capture_decode_header",
+        "ngfx_capture_decode_chunks",
+        "ngfx_capture_decode_toc",
+        "ngfx_capture_decompress_chunk_by_id",
+        "ngfx_capture_decode_events",
+        "ngfx_capture_event_args",
     ]:
         assert must_have in names, f"missing tool: {must_have}"
     # all unique

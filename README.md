@@ -97,6 +97,37 @@ Two layers are exposed:
 | `ngfx_capture_lz4_decompress` | Attempt LZ4-block decompression of a byte range from a capture file. |
 | `ngfx_decode_protobuf_wire` | Generic protobuf-wire-format decoder over a byte range (returns top-level fields without needing the schema). |
 
+### Direct `.ngfx-gfxcap` decoder (RE-derived, no UI required)
+
+Decodes the capture wrapper format end-to-end — no `ngfx-replay` /
+`ngfx-ui` roundtrip needed for the metadata layer. The wrapper is fully
+reverse-engineered: `nlyp` file-magic, then a sequence of chunks each
+prefixed by a 48-byte mini-header (`elif` magic + version + compression
+flag + compressed/uncompressed sizes + chunk-id + self-offset), payload
+either LZ4-block compressed or stored, 16-byte aligned. The file ends
+with a TOC region of `elif`-magic records pointing back to chunk
+offsets. One chunk holds a serialised `NV.PbTableOfContents` with the
+UUID, frame counts, GPU info, primary API, and lists of
+`FunctionInfoChunkIds` + `ResourceInfoChunkIds`.
+
+| Tool | What it answers |
+| --- | --- |
+| `ngfx_capture_decode_header` | Parse the wrapper header — magic / chunk count / TOC location. |
+| `ngfx_capture_decode_chunks` | Iterate the chunk stream — id, size, compression flag, payload offset. |
+| `ngfx_capture_decode_toc` | Decode the `PbTableOfContents` chunk: UUID, GPU, primary API, per-thread info, FunctionInfo + ResourceInfo chunk lists. |
+| `ngfx_capture_decompress_chunk_by_id` | Pull a single chunk and decompress its LZ4 payload to raw bytes. |
+| `ngfx_capture_decode_events` | Best-effort per-event decode (limited — see caveat below). |
+| `ngfx_capture_event_args` | Single-event arg lookup. Same shape as the C++-Capture-derived `ngfx_cpp_capture_event_args` once the FunctionInfo binary layout is fully RE'd. |
+
+**Caveat (work in progress).** The chunks listed by
+`FunctionInfoChunkIds` hold a *binary fixed-stride table*, not
+`PbFunctionCallDesc` protobuf messages — Nsight stores the per-event
+arg stream as packed C-style records, not protobuf. The wrapper +
+TOC are fully decoded so the metadata layer works headless today; the
+per-record layout of FunctionInfo is the remaining RE work for direct
+arg extraction. Until that's done, use the C++-Capture roundtrip path
+above for arg-level queries.
+
 ### Capture session management + inspection
 
 | Tool | What it answers |
@@ -301,7 +332,7 @@ index, and (when present) the C++-Capture index.
 
 ## How big is the surface?
 
-**110 MCP tools** as of this writing, grouped by the sections below.
+**116 MCP tools** as of this writing, grouped by the sections below.
 Run `nsight-graphics-mcp --list-tools` (or import the package and inspect
 `server`) for an up-to-date enumeration.
 
@@ -662,7 +693,7 @@ MIT.
 
 ## Full tool reference
 
-Auto-generated from `server.py` docstrings. **110 tools** organised by
+Auto-generated from `server.py` docstrings. **116 tools** organised by
 the section comments in `server.py` — the order matches what you'd
 discover scrolling the file.
 
@@ -874,6 +905,15 @@ discover scrolling the file.
 - **`ngfx_capture_format_info`** — Structural inspection of a .ngfx-gfxcap file.
 - **`ngfx_capture_lz4_decompress`** — Experimental: attempt LZ4-block decompression of a byte range from a capture file. Useful for probing the chunk layout. Returns a hex preview of the decompressed bytes plus sizes; for unknown blocks, pass a generous ``uncompressed_size_hint`` (defaults to ``len(data) * 8``).
 - **`ngfx_decode_protobuf_wire`** — Experimental: decode a byte range as generic protobuf wire format.
+
+### Direct capture-file decoder (header / chunks / TOC / events)
+
+- **`ngfx_capture_decode_header`** — Decode the wrapper header of a ``.ngfx-capture`` / ``.ngfx-gfxcap``.
+- **`ngfx_capture_decode_chunks`** — List the first ``max_chunks`` chunks of a capture file.
+- **`ngfx_capture_decode_toc`** — Decode the ``NV.PbTableOfContents`` chunk of a capture file.
+- **`ngfx_capture_decompress_chunk_by_id`** — Locate the chunk whose ``kind`` (chunk-id) equals ``chunk_id`` and decompress it.
+- **`ngfx_capture_decode_events`** — Best-effort scan for serialised ``PbFunctionCallDesc`` records.
+- **`ngfx_capture_event_args`** — Look up the per-event arguments at ``event_index`` via direct capture decoding.
 
 ### Extra replay flags discovered via RE
 

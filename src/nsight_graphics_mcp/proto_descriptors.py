@@ -292,7 +292,9 @@ def _describe_descriptor(desc: Any) -> dict[str, Any]:
     }
 
 
-_registry_lock = threading.Lock()
+# Reentrant: get_registry() acquires it then synchronously calls
+# build_registry() on first use, which itself reacquires before storing.
+_registry_lock = threading.RLock()
 _registry: SchemaRegistry | None = None
 
 

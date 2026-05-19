@@ -18,36 +18,96 @@ screenshots), use the JSON-backed tools instead — they wrap
 This document is for the cases those aren't enough — e.g. extracting raw
 resource bytes, full PSO bytecode, or shader-source profiling data.
 
-## File magic
+## File layout (decoded)
 
-Every `.ngfx-gfxcap` starts with 8 ASCII bytes:
-
-```
-0x00:  6e 6c 79 70 65 6c 69 66    "nlypelif"
-```
-
-Read as two little-endian 32-bit words, this is `"pyln" + "file"` —
-i.e. the codename "Pylon file". `Pylon` is the internal name for the
-Nsight Graphics replay engine (see `PylonReplay_PluginInterface.dll` in
-the host bin dir and the protobuf namespace `NV.Pylon.Replay.*`).
-
-## Header (tentative)
-
-The 56 bytes after the magic look like a fixed-size header. Sample from
-a known-good capture:
+Every capture is a sequence of length-prefixed **chunks** prefixed by a
+4-byte file magic:
 
 ```
-0x08:  01 00 00 00 00 00 00 00    u64  version = 1
-0x10:  01 00 00 00                u32  flags or sub-version = 1
-0x14:  cc 1c 00 00 00 00 00 00    u64  ? (tentative: header size = 0x1ccc = 7372)
-0x1c:  00 39 00 00 00 00 00 00    u64  ? (tentative: uncompressed payload size = 0x3900 = 14592)
-0x24:  04 00 00 00 00 00 00 00    u64  ? (tentative: compression = LZ4)
-0x2c:  04 00 00 00 00 00 00 00    u64  ?
-0x34:  00 11 00 01 00 ff 03 40    starts looking like LZ4 block data
++-------------------------------------------------------------------+
+| 0x00  4 bytes  "nlyp"   (file-magic prefix, exactly once)         |
++-------------------------------------------------------------------+
+| 0x04  Chunk #0   (48-byte mini-header + payload + alignment pad)  |
+| ....  Chunk #1   ...                                              |
+| ....  ...                                                         |
++-------------------------------------------------------------------+
+| TOC region (`elif`-magic records pointing at real chunks)         |
++-------------------------------------------------------------------+
 ```
 
-Field interpretation is **tentative** — confirmed by structural fit but
-not by direct decompilation. Pending more RE work.
+The 8-byte ASCII string `"nlypelif"` at offset 0 is actually
+`nlyp` + chunk-#0's `elif` magic — i.e. `"nlyp"` is the file magic
+prefix and every chunk starts with `"elif"` (= `0x66696c65` = "file" as
+LE u32). Read as two little-endian 32-bit words, this is "pyln" + "file"
+— hence the internal codename "Pylon file" (`PylonReplay_PluginInterface.dll`,
+protobuf namespace `NV.Pylon.Replay.*`).
+
+### Per-chunk 48-byte mini-header
+
+| offset | size | meaning |
+| --- | --- | --- |
+| `+0x00` | 4 | magic `"elif"` (= `0x66696c65`) |
+| `+0x04` | 8 | `u64 version`           (observed: `1`) |
+| `+0x0c` | 4 | `u32 compression_flag`  (`1` = LZ4-block, `0` = stored) |
+| `+0x10` | 8 | `u64 compressed_size`   (bytes of payload; `0` for stored) |
+| `+0x18` | 8 | `u64 uncompressed_size` (decompressed size; raw size for stored) |
+| `+0x20` | 8 | `u64 chunk_id` (the *kind* / unique chunk identifier) |
+| `+0x28` | 8 | `u64 self_offset` (this chunk's own absolute byte offset) |
+
+Payload immediately follows the header. **Compression**: when
+`compression_flag == 1` the payload is raw LZ4-block (no frame header)
+of `compressed_size` bytes — call `lz4.block.decompress(payload,
+uncompressed_size=...)`. When `compression_flag == 0` the payload is
+`uncompressed_size` bytes verbatim. After the payload, chunks are
+padded with zeros to a **16-byte boundary** before the next chunk's
+`elif` magic.
+
+### TOC (table of contents) region
+
+At the end of a real chunk stream comes a region of records that *look*
+like chunk headers (they start with `elif` and have the same 48-byte
+layout) but whose `self_offset` points to an *earlier* chunk in the
+file — i.e. each TOC entry is a pointer to a real chunk. To stop
+iteration cleanly, reject any chunk whose `self_offset != current_offset`
+or whose `payload_end > file_size`.
+
+### `PbTableOfContents` chunk
+
+Exactly one real chunk (`chunk_id == 1` in observed captures) contains
+a serialised `NV.PbTableOfContents` protobuf:
+
+```
+NV.PbTableOfContents
+  Version: u32
+  Uuid: string
+  NumChunks: u64
+  NumThreads: u32
+  FunctionInfoChunkIds: repeated u64   # chunk ids that hold per-event data
+  ResourceInfoChunkIds: repeated u64   # chunk ids that hold per-resource data
+  MetaData: PbMetaData                 # process / GPU / API / nsight version
+  ApiInfo: PbApiInfo                   # D3D12 / Vulkan / NGX resource tables
+  ThreadInfo: repeated PbThreadInfo    # thread id + name
+  FileResource: repeated PbFileResource
+  UserFileResource: repeated PbUserFileResource
+  GlobalDriverSettings / ApplicationDriverSettings / BaseDriverSettings:
+    PbDriverRegistrySettings
+```
+
+`parse_table_of_contents()` in `capture_decoder.py` returns this as a
+structured dict.
+
+### Per-event records (NOT YET DECODED)
+
+The chunk whose ID is in `FunctionInfoChunkIds` holds a **binary
+fixed-stride table** — NOT a sequence of `PbFunctionCallDesc` messages.
+Each record appears to be ~48 bytes of packed integers
+(`function_id`, `thread_id`, `sequence_id`, timestamps, ...), and the
+function-name mapping lives in a separate "schema" chunk that embeds
+the API protobuf descriptors.
+
+So for now: use `--metadata-functions` (wrapped by `ngfx_index_events`)
+for reliable per-event data with function names. Direct argument
+decoding remains an open problem — see "What's NOT (yet) known" below.
 
 ## Payload encoding
 
@@ -187,14 +247,23 @@ the generic `ngfx_replay_run_advanced`.
 
 ## What's NOT (yet) known
 
-* Exact byte layout of the post-magic header (the 56 bytes immediately
-  following `nlypelif`).
-* Per-chunk offsets / table-of-contents — the file looks like multiple
-  framed sections but the framing format isn't fully decoded.
-* The mapping from `PbBlobEntry` payloads to specific resource UIDs
-  (would let us extract raw resource bytes / shader bytecode).
-* The `PbEncryptedData` payload structure (some blobs are encrypted with
-  a `PbMethod` enum we haven't decoded).
+* **Fixed-stride layout of the FunctionInfo chunk** — confirmed binary,
+  but the exact tuple `(field offset, width, semantics)` of each event
+  record needs to be reverse-engineered to recover `function_id`,
+  `thread_index`, timestamps, etc.
+* **Function-id ↔ function-name table** — the names presumably live in
+  one of the small early chunks or in the bundled `.proto` descriptor
+  blob embedded as a chunk; mapping is unsolved.
+* **Per-call argument bytes** — even once `function_id` is recovered,
+  the argument blobs need a per-API descriptor (D3D12 / Vulkan / OpenGL)
+  to interpret each function's argument layout. The descriptors are
+  embedded in the capture itself (chunk 22050 in our sample has
+  `"ApiInspector/ApiInspectorMessages.proto"` strings), but the routing
+  from a `function_id` to the right descriptor isn't decoded yet.
+* **`PbBlobEntry` → resource UID mapping** — would let us extract raw
+  resource bytes / shader bytecode.
+* **`PbEncryptedData` payload structure** — some blobs are encrypted
+  with a `PbMethod` enum we haven't decoded.
 
 ## How to keep going
 
@@ -212,5 +281,13 @@ If you want to push this further:
    internal APIs the UI uses.
 
 The MCP exposes the building blocks for (1) and (2): `ngfx_proto_schemas`,
-`ngfx_capture_format_info`, `ngfx_capture_lz4_decompress`, and
-`ngfx_decode_protobuf_wire`.
+`ngfx_capture_format_info`, `ngfx_capture_lz4_decompress`,
+`ngfx_decode_protobuf_wire`, plus the new direct-decoder tools:
+
+* `ngfx_capture_decode_header` — file-magic check + first chunk's mini-header
+* `ngfx_capture_decode_chunks` — list chunks (header, sizes, kind, offset)
+* `ngfx_capture_decode_toc` — decode the `PbTableOfContents` chunk
+* `ngfx_capture_decompress_chunk_by_id` — fetch chunk by its `chunk_id`
+* `ngfx_capture_decode_events` — best-effort `PbFunctionCallDesc` scan (limited)
+* `ngfx_capture_event_args` — single-event lookup (same shape as
+  `ngfx_cpp_capture_event_args`)

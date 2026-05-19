@@ -1,10 +1,28 @@
 """Direct ``.ngfx-gfxcap`` / ``.ngfx-capture`` decoder.
 
 This module decodes the **container format** of an Nsight Graphics capture
-file and exposes the decompressed protobuf payloads as Python objects. It
-is intentionally independent of the C++-capture parser (``cpp_capture_parser``)
-— both code paths solve the same problem (recovering per-event arguments)
-through different means.
+file and exposes the decompressed payloads as Python objects. It is
+intentionally independent of the C++-capture parser
+(``cpp_capture_parser``) — both code paths solve the same problem
+(recovering per-event arguments) through different means.
+
+Status (2026-05)
+----------------
+
+  * **Container layout** — fully decoded (see below).
+  * **Chunk iteration** — works; reads the chunk stream end-to-end without
+    over-reading into the trailer (see ``iter_chunk_headers``).
+  * **LZ4 + stored decompression** — works.
+  * **Table of contents** — fully decoded via ``parse_table_of_contents``.
+    From the TOC we get ``FunctionInfoChunkIds``, ``ResourceInfoChunkIds``,
+    plus capture metadata (process name, UUID, GPU, API).
+  * **Per-event argument decoding** — **NOT yet decoded**. The function
+    info chunk (the chunk whose ID is in ``FunctionInfoChunkIds``) is a
+    *binary table* of fixed-stride records, not a sequence of serialised
+    ``PbFunctionCallDesc`` messages. Walking that table requires the
+    schema-descriptor chunk (a separate chunk holding the embedded
+    ``.proto`` descriptors used to materialise per-call arguments).
+    See ``docs/CAPTURE_FORMAT.md`` for the open questions.
 
 Container format (reverse-engineered, see ``docs/CAPTURE_FORMAT.md``)
 --------------------------------------------------------------------
@@ -292,6 +310,23 @@ def chunk_summary(path: Path, *, max_chunks: int | None = 256) -> dict[str, Any]
 
 
 # ---------------------------------------------------------------------------
+# Chunk lookup by ID (kind)
+# ---------------------------------------------------------------------------
+
+
+def find_chunk_by_kind(path: Path, kind: int) -> ChunkHeader | None:
+    """Return the first chunk whose ``kind`` (chunk-id) equals ``kind``.
+
+    The chunk's ``kind`` field is the stable identifier referenced from the
+    table of contents (``FunctionInfoChunkIds`` etc.).
+    """
+    for h in iter_chunk_headers(path):
+        if h.kind == kind:
+            return h
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Decompression
 # ---------------------------------------------------------------------------
 
@@ -323,10 +358,23 @@ def decompress_chunk(path: Path, header: ChunkHeader) -> bytes:
 
 
 # Lazy global handle on the proto registry — avoids a hard import dep when
-# users only need header / chunk inspection.
+# users only need header / chunk inspection. We bypass
+# ``proto_descriptors.get_registry()`` because of a known re-entrant-lock
+# deadlock in that helper (it acquires ``_registry_lock`` then synchronously
+# calls ``build_registry`` which re-acquires the same non-reentrant lock).
+_REGISTRY: Any = None
+
+
 def _get_registry():
-    from . import proto_descriptors
-    return proto_descriptors.get_registry()
+    global _REGISTRY
+    if _REGISTRY is None:
+        from . import proto_descriptors
+        # Prefer the cached registry if someone already built one.
+        if proto_descriptors._registry is not None:
+            _REGISTRY = proto_descriptors._registry
+        else:
+            _REGISTRY = proto_descriptors.build_registry()
+    return _REGISTRY
 
 
 def _read_varint(buf: bytes, pos: int) -> tuple[int | None, int]:
@@ -547,6 +595,111 @@ def _build_event(
 
 
 # ---------------------------------------------------------------------------
+# Table of contents
+# ---------------------------------------------------------------------------
+
+
+def parse_table_of_contents(path: Path) -> dict[str, Any]:
+    """Find and decode the capture's ``NV.PbTableOfContents`` chunk.
+
+    The TOC chunk's ``kind`` is not fixed (the ID is the *value* of field 1
+    of the TOC itself, which varies per capture). We probe candidate small-
+    to-medium chunks and accept the first whose payload parses as a TOC
+    with non-zero ``Version`` and ``NumChunks > 100``.
+
+    Returns a dict like::
+
+      {
+        "ok": True,
+        "chunk": {...header...},
+        "uuid": "...",
+        "num_chunks": 22098,
+        "num_threads": 28,
+        "function_info_chunk_ids": [5],
+        "resource_info_chunk_ids": [21421],
+        "metadata": {"process_name": ..., "primary_api": ..., ...},
+      }
+    """
+    reg = _get_registry()
+    try:
+        toc_cls = reg.message_class("NV.PbTableOfContents")
+    except Exception as exc:
+        return {"ok": False, "error": f"PbTableOfContents not in schema pool: {exc}"}
+
+    # Probe every chunk in the file whose decompressed payload could be a
+    # protobuf message (small/medium size, starts with a tag byte). The TOC
+    # is usually well under 200 KB.
+    for h in iter_chunk_headers(path):
+        if h.uncompressed_size > 256 * 1024:
+            continue
+        try:
+            data = decompress_chunk(path, h)
+        except Exception:
+            continue
+        if not data or data[0] > 0x80:
+            continue
+        toc = toc_cls()
+        try:
+            toc.ParseFromString(data)
+        except Exception:
+            continue
+        if toc.Version > 0 and toc.NumChunks > 100 and toc.Uuid:
+            return _toc_to_dict(h, toc)
+    return {"ok": False, "error": "no PbTableOfContents chunk found"}
+
+
+def _toc_to_dict(header: ChunkHeader, toc: Any) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "ok": True,
+        "chunk": header.to_dict(),
+        "version": toc.Version,
+        "uuid": toc.Uuid,
+        "num_chunks": toc.NumChunks,
+        "num_threads": toc.NumThreads,
+        "function_info_chunk_ids": list(toc.FunctionInfoChunkIds),
+        "resource_info_chunk_ids": list(toc.ResourceInfoChunkIds),
+        "file_resources": [
+            {"sub_path": r.FileSubPath, "chunk_id": r.ChunkID}
+            for r in toc.FileResource
+        ],
+        "user_file_resources": [
+            {"id": int(r.ID), "file_path": r.FilePath, "chunk_id": r.ChunkID}
+            for r in toc.UserFileResource
+        ],
+        "thread_info": [
+            {"id": t.ID, "name": t.Name} for t in toc.ThreadInfo
+        ],
+    }
+    if toc.HasField("MetaData"):
+        md = toc.MetaData
+        out["metadata"] = {
+            "nsight_version": md.NsightVersion,
+            "nsight_branch": md.NsightBranch,
+            "process_name": md.ProcessName,
+            "process_file_name": md.ProcessFileName,
+            "process_command_line": md.ProcessCommandLine,
+            "primary_api": md.PrimaryAPI,
+            "os_info": md.OsInfo,
+            "primary_gpu": md.PrimaryGPU,
+            "request_time": md.RequestTime,
+            "host_name": md.HostName,
+            "capture_begin_frame": md.CaptureBeginFrame,
+            "captured_frame_count": md.CapturedFrameCount,
+        }
+    if toc.HasField("ApiInfo"):
+        ai = toc.ApiInfo
+        out["api_info"] = {}
+        if ai.HasField("D3D12"):
+            out["api_info"]["d3d12_resource_count"] = len(ai.D3D12.ResourceInfo)
+        if ai.HasField("Vulkan"):
+            out["api_info"]["vulkan_resource_count"] = len(ai.Vulkan.ResourceInfo)
+            out["api_info"]["vulkan_sc"] = ai.Vulkan.VulkanSC
+        if ai.HasField("NGX"):
+            out["api_info"]["ngx_plugin_count"] = len(ai.NGX.PluginInfo)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Top-level API
 # ---------------------------------------------------------------------------
 
@@ -558,10 +711,21 @@ def decode_events(
     limit: int = 200,
     max_chunks_scanned: int | None = None,
 ) -> dict[str, Any]:
-    """Decompress chunks and extract per-event ``PbFunctionCallDesc`` records.
+    """Best-effort per-event extraction.
 
-    Returns a dict with the matched events (sliced to ``[start, start+limit)``)
-    plus stats about how many chunks were scanned.
+    .. warning::
+       This scans chunk payloads for byte sequences that look like
+       serialised ``PbFunctionCallDesc`` messages. In current Nsight
+       captures the per-event records live in a **binary fixed-stride
+       table** (the chunk whose ID is in ``PbTableOfContents.FunctionInfoChunkIds``),
+       NOT as repeated ``PbFunctionCallDesc`` messages. So this function
+       will usually return zero events for real captures — that's expected.
+
+       For a structured TOC dump (which IS decoded), use
+       :func:`parse_table_of_contents` instead. To resolve the binary
+       per-event records to function names + args, future work will need
+       to (a) decode the fixed-stride record layout and (b) cross-reference
+       function IDs against the embedded API descriptor chunk.
     """
     reg = _get_registry()
     pb_cls = reg.message_class("NV.EventParameters.Messages.PbFunctionCallDesc")
@@ -573,6 +737,10 @@ def decode_events(
 
     for header in iter_chunk_headers(path, max_chunks=max_chunks_scanned):
         chunks_scanned += 1
+        # Skip very large chunks — they're typically resource bytes, not
+        # the API-call stream. Cap at 4 MiB.
+        if header.uncompressed_size > 4 * 1024 * 1024:
+            continue
         try:
             payload = decompress_chunk(path, header)
         except Exception:
@@ -596,6 +764,7 @@ def decode_events(
 
     window = events[start:start + limit]
     return {
+        "ok": True,
         "path": str(path),
         "chunks_scanned": chunks_scanned,
         "chunks_with_events": chunks_with_events,
@@ -604,11 +773,22 @@ def decode_events(
         "start": start,
         "limit": limit,
         "events": [e.to_dict() for e in window],
+        "notes": (
+            "Per-event records live in a binary fixed-stride table, not as "
+            "PbFunctionCallDesc protobuf messages — this scan typically "
+            "returns zero events. Use ngfx_capture_decode_toc or the "
+            "JSON-backed `ngfx_index_events` tool for reliable per-event "
+            "data."
+        ),
     }
 
 
 def event_args(path: Path, event_index: int) -> dict[str, Any] | None:
-    """Return the per-event record at ``event_index`` (linear scan)."""
+    """Return the per-event record at ``event_index`` (linear scan).
+
+    Same caveats as :func:`decode_events`. Returns ``None`` if no event was
+    extracted at that index — which is the common case for real captures.
+    """
     result = decode_events(path, start=event_index, limit=1)
     if not result["events"]:
         return None

@@ -40,6 +40,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from . import (
+    capture_decoder as capture_decoder_mod,
     capture_diff as capture_diff_mod,
     capture_format as capture_format_mod,
     capture_info,
@@ -2932,6 +2933,161 @@ async def ngfx_decode_protobuf_wire(
     return capture_format_mod.decode_protobuf_wire(
         data[offset:end], max_fields=max_fields
     )
+
+
+# ---------------------------------------------------------------------------
+# Direct capture-file decoder (header / chunks / TOC / events)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def ngfx_capture_decode_header(capture: str) -> dict[str, Any]:
+    """Decode the wrapper header of a ``.ngfx-capture`` / ``.ngfx-gfxcap``.
+
+    Returns the 4-byte ``nlyp`` file-magic check plus the parsed 48-byte
+    mini-header of the first chunk: version, compression flag, compressed
+    + uncompressed sizes, chunk-id (``kind``) and its absolute offset.
+
+    The full format is documented in :mod:`nsight_graphics_mcp.capture_decoder`.
+    """
+    try:
+        _, path = _resolve_capture(capture)
+        hdr = capture_decoder_mod.decode_header(path)
+        return {"ok": True, **hdr.to_dict()}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@mcp.tool()
+async def ngfx_capture_decode_chunks(
+    capture: str,
+    max_chunks: int = 256,
+) -> dict[str, Any]:
+    """List the first ``max_chunks`` chunks of a capture file.
+
+    Each chunk has a 48-byte mini-header (``elif`` magic + version +
+    compression flag + sizes + chunk-id + self-offset). The list is sliced
+    to ``max_chunks`` because real captures contain tens of thousands of
+    chunks.
+    """
+    try:
+        _, path = _resolve_capture(capture)
+        return {"ok": True, **capture_decoder_mod.chunk_summary(path, max_chunks=max_chunks)}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@mcp.tool()
+async def ngfx_capture_decode_toc(capture: str) -> dict[str, Any]:
+    """Decode the ``NV.PbTableOfContents`` chunk of a capture file.
+
+    The TOC is the canonical index built by ``ngfx-capture``: it lists the
+    chunk IDs that hold per-event function info, per-resource info, plus
+    capture metadata (process name, GPU, primary API, frame counts, UUID,
+    thread list).
+
+    Returns a structured dict with ``uuid``, ``num_chunks``, ``num_threads``,
+    ``function_info_chunk_ids``, ``resource_info_chunk_ids``, ``metadata``,
+    ``api_info``, and ``thread_info``. Requires Nsight Graphics installed
+    (the proto descriptor pool is built from ``ngfx-replay.exe``).
+    """
+    try:
+        _, path = _resolve_capture(capture)
+        return capture_decoder_mod.parse_table_of_contents(path)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@mcp.tool()
+async def ngfx_capture_decompress_chunk_by_id(
+    capture: str,
+    chunk_id: int,
+    preview_bytes: int = 256,
+) -> dict[str, Any]:
+    """Locate the chunk whose ``kind`` (chunk-id) equals ``chunk_id`` and
+    decompress it.
+
+    Returns the chunk header + a hex preview of the first ``preview_bytes``
+    bytes of the decompressed payload. Useful for inspecting chunks listed
+    in ``ngfx_capture_decode_toc``'s ``function_info_chunk_ids`` /
+    ``resource_info_chunk_ids``.
+    """
+    try:
+        _, path = _resolve_capture(capture)
+        hdr = capture_decoder_mod.find_chunk_by_kind(path, chunk_id)
+        if hdr is None:
+            return {"ok": False, "error": f"no chunk with kind={chunk_id} found"}
+        data = capture_decoder_mod.decompress_chunk(path, hdr)
+        return {
+            "ok": True,
+            "chunk": hdr.to_dict(),
+            "decompressed_size": len(data),
+            "preview_hex": data[:preview_bytes].hex(),
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@mcp.tool()
+async def ngfx_capture_decode_events(
+    capture: str,
+    start: int = 0,
+    limit: int = 200,
+    max_chunks_scanned: int | None = None,
+) -> dict[str, Any]:
+    """Best-effort scan for serialised ``PbFunctionCallDesc`` records.
+
+    .. note::
+       In current Nsight captures the per-event records live in a binary
+       fixed-stride table, not as repeated ``PbFunctionCallDesc`` messages.
+       This tool will usually return zero events for real captures — that's
+       expected. Use ``ngfx_index_events`` / ``ngfx_find_events`` for
+       reliable per-event data (they wrap ``ngfx-replay --metadata-functions``).
+
+       This tool remains useful for: (a) verifying the chunk iterator finds
+       all chunks, (b) inspecting future captures that may switch to a
+       protobuf-encoded event stream.
+    """
+    try:
+        _, path = _resolve_capture(capture)
+        return capture_decoder_mod.decode_events(
+            path, start=start, limit=limit, max_chunks_scanned=max_chunks_scanned,
+        )
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@mcp.tool()
+async def ngfx_capture_event_args(
+    capture: str,
+    event_index: int,
+) -> dict[str, Any]:
+    """Look up the per-event arguments at ``event_index`` via direct
+    capture decoding.
+
+    Companion to ``ngfx_cpp_capture_event_args`` (which works from a
+    Generate-C++-Capture project) — same response shape so callers can
+    swap between them.
+
+    See the caveats on ``ngfx_capture_decode_events`` — current captures
+    don't store events as protobuf messages, so this typically returns
+    ``ok: false`` with a "not found" error. For reliable per-event lookup
+    use ``ngfx_cpp_capture_event_args`` or ``ngfx_find_events``.
+    """
+    try:
+        _, path = _resolve_capture(capture)
+        rec = capture_decoder_mod.event_args(path, event_index)
+        if rec is None:
+            return {
+                "ok": False,
+                "error": (
+                    f"event {event_index} not found via direct decoding "
+                    "(per-event records are in a binary table, not protobuf)"
+                ),
+            }
+        return {"ok": True, "call": rec}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
 
 
 # ---------------------------------------------------------------------------
