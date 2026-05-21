@@ -11,13 +11,11 @@ These verify that:
 
 from __future__ import annotations
 
-import asyncio
 import os
 import sys
 from pathlib import Path
 
 import pytest
-
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
@@ -36,8 +34,13 @@ def test_tool_registration() -> None:
     for must_have in [
         "ngfx_environment",
         "ngfx_capture_launched",
+        "ngfx_deep_capture_capability_report",
         "ngfx_graphics_capture_launched",
         "ngfx_gputrace_launched",
+        "ngfx_gputrace_capture_replay",
+        "ngfx_gputrace_shader_pipeline_search",
+        "ngfx_gputrace_export_summary",
+        "ngfx_gputrace_export_search",
         "ngfx_cpp_capture_launched",
         "ngfx_framedebugger_launched",
         "ngfx_replay_run",
@@ -45,6 +48,96 @@ def test_tool_registration() -> None:
         "ngfx_find_events",
         "ngfx_sdk_reference",
         "ngfx_sdk_snippet",
+        "ngfx_ida_environment",
+        "ngfx_ida_analyze_binary",
+        "ngfx_ida_search_facts",
+        "ngfx_cpp_capture_saved_bridge_re_analyze",
+        "ngfx_cpp_capture_saved_bridge_re_report",
+        "ngfx_cpp_capture_saved_pylon_handoff_preview",
+        "ngfx_pylon_private_bridge_re_report",
+        "ngfx_pylon_bridge_probe_plan",
+        "ngfx_pylon_activity_manager_static_binding_report",
+        "ngfx_pylon_bridge_helper_scaffold",
+        "ngfx_pylon_bridge_probe_log_analyze",
+        "ngfx_pylon_private_binding_from_probe",
+        "ngfx_pylon_direct_call_binding_from_probe",
+        "ngfx_pylon_bridge_probe_run",
+        "ngfx_pylon_frida_direct_call_run",
+        "ngfx_private_executor_readiness_report",
+        "ngfx_private_executor_evidence_bundle",
+        "ngfx_pylon_private_bridge_invoke",
+        "ngfx_pylon_saved_cpp_export",
+        "ngfx_cpp_capture_saved_direct_rpc_plan",
+        "ngfx_rpc_direct_export_binding_candidate",
+        "ngfx_cpp_capture_saved_direct_rpc_export",
+        "ngfx_cpp_capture_saved_file_transfer_apply",
+        "ngfx_cpp_capture_saved_output_dir_setting",
+        "ngfx_cpp_capture_saved_export_validate",
+        "ngfx_cpp_capture_saved_ui_automation_attempt",
+        "ngfx_cpp_capture_saved_headless_attempt",
+        "ngfx_cpp_capture_saved_artifact_bundle",
+        "ngfx_shader_fix_regression_score",
+        "ngfx_shader_debug_re_status",
+        "ngfx_frame_debugger_rpc_schema",
+        "ngfx_pixel_history",
+        "ngfx_resource_access_history",
+        "ngfx_resource_revision_at_event",
+        "ngfx_rpc_open_capture_session",
+        "ngfx_rpc_endpoint_resolve",
+        "ngfx_rpc_endpoint_probe",
+        "ngfx_rpc_capture_session_status",
+        "ngfx_rpc_close_capture_session",
+        "ngfx_rpc_call_binary_replay",
+        "ngfx_rpc_find_live_events",
+        "ngfx_rpc_decode_frame",
+        "ngfx_rpc_transcript_import",
+        "ngfx_rpc_session_binding_report",
+        "ngfx_sn2_fog_artifacts",
+        "ngfx_sn2_fog_signal_report",
+        "ngfx_sn2_fog_fix_plan",
+        "ngfx_sn2_fog_descriptor_probe_plan",
+        "ngfx_sn2_fog_slot_candidates",
+        "ngfx_sn2_fog_probe_manifest",
+        "ngfx_sn2_fog_live_state_probe",
+        "ngfx_sn2_copyrect_artifacts",
+        "ngfx_sn2_copyrect_signal_report",
+        "ngfx_sn2_copyrect_fix_plan",
+        "ngfx_sn2_copyrect_descriptor_probe_plan",
+        "ngfx_sn2_copyrect_slot_candidates",
+        "ngfx_sn2_copyrect_t0_source_compare",
+        "ngfx_sn2_copyrect_pair_analysis",
+        "ngfx_sn2_copyrect_right_eye_issue_report",
+        "ngfx_sn2_copyrect_source_lineage_report",
+        "ngfx_sn2_copyrect_runtime_instrumentation_plan",
+        "ngfx_sn2_copyrect_live_state_probe",
+        "ngfx_sn2_copyrect_live_pair_probe",
+        "ngfx_eye_issue_event_signatures",
+        "ngfx_eye_issue_dump_report",
+        "ngfx_sn2_repro_plan",
+        "ngfx_sn2_repro_run",
+        "ngfx_cpp_capture_from_saved_capture",
+        "ngfx_pair_eye_events",
+        "ngfx_resolve_shader_slots",
+        "ngfx_descriptor_resource_candidates",
+        "ngfx_trace_roi_history",
+        "ngfx_resource_producer_graph",
+        "ngfx_import_uevr_trace",
+        "ngfx_pso_rehydration_plan",
+        "ngfx_shader_probe_execution_plan",
+        "ngfx_diff_hdr_roi",
+        "ngfx_autofix_loop_plan",
+        "ngfx_validate_fix_claim",
+        "ngfx_cpp_capture_dump",
+        "ngfx_shader_triage_plan",
+        "ngfx_eye_event_index",
+        "ngfx_compare_eye_passes",
+        "ngfx_find_missing_eye_dispatches",
+        "ngfx_event_state",
+        "ngfx_trace_resource_lineage",
+        "ngfx_pso_bind_trace",
+        "ngfx_pso_swap_harness_plan",
+        "ngfx_shader_probe_plan",
+        "ngfx_shader_bug_triage",
         "ngfx_layer_install",
         "ngfx_raw",
         # direct capture decoder
@@ -52,6 +145,9 @@ def test_tool_registration() -> None:
         "ngfx_capture_decode_chunks",
         "ngfx_capture_decode_toc",
         "ngfx_capture_decompress_chunk_by_id",
+        "ngfx_capture_search_payloads",
+        "ngfx_capture_shader_chunks",
+        "ngfx_capture_chunk_references",
         "ngfx_capture_decode_events",
         "ngfx_capture_event_args",
     ]:
@@ -109,7 +205,12 @@ def test_classify_events() -> None:
     from nsight_graphics_mcp.events import classify
 
     assert classify("DrawIndexedInstanced") == "draw"
+    assert classify("ID3D12GraphicsCommandList_DrawIndexedInstanced") == "draw"
     assert classify("vkCmdDispatch") == "dispatch"
+    assert classify("ID3D12GraphicsCommandList_Dispatch") == "dispatch"
+    assert classify("ID3D12GraphicsCommandList_SetPipelineState") == "pipeline"
+    assert classify("ID3D12Device_CopyDescriptors") == "descriptor"
+    assert classify("ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable") == "set_state"
     assert classify("ResourceBarrier") == "barrier"
     assert classify("Present") == "present"
     assert classify("DispatchRays") == "ray_tracing"

@@ -6,6 +6,7 @@ the MCP can answer 'find the capture I just took' without re-implementing
 the UI's state.
 
 Capture extensions in the wild:
+  * ``.ngfx-capture`` — current Graphics Capture format in recent Nsight docs
   * ``.ngfx-gfxcap``  — current Graphics Capture format
   * ``.gfxcap``       — legacy alias
   * ``.nsightgfx``    — extremely old; we still recognise it
@@ -20,8 +21,7 @@ from typing import Any
 
 from .config import Settings, default_captures_dir, default_gputrace_dir, get_settings
 
-
-CAPTURE_EXTS = (".ngfx-gfxcap", ".gfxcap", ".nsightgfx", ".nsight-gfxcapture")
+CAPTURE_EXTS = (".ngfx-capture", ".ngfx-gfxcap", ".gfxcap", ".nsightgfx", ".nsight-gfxcapture")
 GPUTRACE_EXTS = (".nsight-gputrace", ".gputrace")
 
 

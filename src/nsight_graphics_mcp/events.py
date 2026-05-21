@@ -24,9 +24,10 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from .cli import run_async
 from .config import Settings, default_cache_dir, get_settings
@@ -96,6 +97,7 @@ _PIPELINE = {
     "vkCreateGraphicsPipelines", "vkCreateComputePipelines", "vkCreateRayTracingPipelinesKHR",
     "vkDestroyPipeline", "vkCmdBindPipeline",
     "CreateGraphicsPipelineState", "CreateComputePipelineState", "CreateStateObject",
+    "SetPipelineState",
 }
 _DESCRIPTOR = {
     "vkAllocateDescriptorSets", "vkUpdateDescriptorSets",
@@ -128,31 +130,42 @@ _SET_STATE_PREFIXES = (
 
 
 def classify(name: str) -> str:
-    if name in _DRAW:
+    candidates = _function_name_candidates(name)
+    if any(candidate in _DRAW for candidate in candidates):
         return "draw"
-    if name in _DISPATCH:
+    if any(candidate in _DISPATCH for candidate in candidates):
         return "dispatch"
-    if name in _COPY:
+    if any(candidate in _COPY for candidate in candidates):
         return "copy"
-    if name in _BARRIER:
+    if any(candidate in _BARRIER for candidate in candidates):
         return "barrier"
-    if name in _PRESENT:
+    if any(candidate in _PRESENT for candidate in candidates):
         return "present"
-    if name in _RAY_TRACING:
+    if any(candidate in _RAY_TRACING for candidate in candidates):
         return "ray_tracing"
-    if name in _SYNC:
+    if any(candidate in _SYNC for candidate in candidates):
         return "sync"
-    if name in _PIPELINE:
+    if any(candidate in _PIPELINE for candidate in candidates):
         return "pipeline"
-    if name in _DESCRIPTOR:
+    if any(candidate in _DESCRIPTOR for candidate in candidates):
         return "descriptor"
-    if name in _RESOURCE:
+    if any(candidate in _RESOURCE for candidate in candidates):
         return "resource"
-    if name in _CMDBUF:
+    if any(candidate in _CMDBUF for candidate in candidates):
         return "cmd_buffer"
-    if any(name.startswith(p) for p in _SET_STATE_PREFIXES):
+    if any(candidate.startswith(p) for candidate in candidates for p in _SET_STATE_PREFIXES):
         return "set_state"
     return "other"
+
+
+def _function_name_candidates(name: str) -> tuple[str, ...]:
+    """Return raw + API-method suffix forms used by Nsight metadata streams."""
+    if "_" not in name:
+        return (name,)
+    suffix = name.rsplit("_", 1)[-1]
+    if suffix == name:
+        return (name,)
+    return (name, suffix)
 
 
 @dataclass
@@ -425,6 +438,6 @@ def sql_query(db_path: Path, sql: str, params: Iterable[Any] = ()) -> list[dict[
         cur = conn.execute(sql, tuple(params))
         cols = [c[0] for c in cur.description] if cur.description else []
         rows = cur.fetchall()
-        return [dict(zip(cols, row)) for row in rows]
+        return [dict(zip(cols, row, strict=False)) for row in rows]
     finally:
         conn.close()

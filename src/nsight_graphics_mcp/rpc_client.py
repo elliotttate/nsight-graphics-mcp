@@ -5,18 +5,18 @@ Reverse-engineered from the ngfx-rpc.exe binary (NVIDIA Nsight Graphics
 
 Status
 ------
-The transport-level **8-byte frame header** and the **dispatch model**
-(``(category u32, method u32)``) are fully reverse-engineered with high
-confidence; the **C++ MessageHeader** that prefixes the protobuf body on
-the wire is still partially conjectural (its in-memory layout is known to
-byte-precision but its on-wire serialization format was not observed
-live). This module therefore exposes two layers:
+The transport-level **8-byte frame header**, the **24-byte MessageHeader**
+wire encoding, and the **dispatch model** (``(category u32, method u32)``)
+are reverse-engineered. The remaining live gap for FrameDebugger automation
+is the private BinaryReplay namespace/session/slot binding the UI performs
+before replay requests are accepted. This module therefore exposes two
+layers:
 
 * :class:`RpcTransport` — handles the 8-byte transport framing. Sends/
   receives ``(channelId, payload_bytes)`` tuples. **This layer is robust.**
 
-* :class:`RpcClient` — adds the (still-being-verified) ``MessageHeader +
-  protobuf-body`` payload format and the high-level method-call API.
+* :class:`RpcClient` — adds the decoded ``MessageHeader + protobuf-body``
+  payload format and the high-level method-call API.
 
 The constants and enums in this file are sourced directly from the
 embedded ``*.proto`` files (extracted via
@@ -39,16 +39,19 @@ References (file offsets are in ``ngfx-rpc.exe`` v2026.1.0.0):
 
 from __future__ import annotations
 
+import ctypes
+import os
 import socket
 import struct
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import proto_descriptors
+from google.protobuf.json_format import MessageToDict
 
+from . import proto_descriptors
 
 # ---------------------------------------------------------------------------
 # Wire-level constants (8-byte transport frame)
@@ -75,37 +78,23 @@ FRAME_HEADER_SIZE = 8
 # Dispatch enumeration (category IDs)
 # ---------------------------------------------------------------------------
 #
-# Categories are assigned globally; the value used for "Diagnostics" can be
-# pinned: in ``ping_recv__sub_1407D28B0`` (the periodic data-buffer pinger)
-# the message header is initialised with
-#   dword_14128FE40 = 1   -> category
-#   dword_14128FE44 = 6   -> method   (matches ``DiagnosticsMethod::DataBuffer = 6``)
-#
-# Therefore the global category-id table appears to be (in declaration order
-# as observed in the binary's RTTI for SystemService's installed handlers):
-#
-#   1  Diagnostics
-#   2  Handshake
-#   3  Connection
-#   4  Discovery / LocalDiscovery
-#   5  DeviceInfo
-#   6  SystemInfo
-#   7  BinaryReplay
-#   8  WarpVizTarget / WarpVizHost / WarpVizChunk
-#
-# Pinned with confidence: 1 = Diagnostics. The rest were determined from
-# the order ``SystemService`` registers its handlers in the binary RTTI
-# (``CreateMethodHandler<...AttachMessage>`` etc.) and from the
-# ``MethodMap::TryGetMethodHandler`` log format.
+# System categories are pinned by the embedded ``SystemCategories.proto`` in
+# ngfx-rpc.exe. Pylon replay uses its own category namespace from
+# ``PylonUi.proto``: ``CategoryBinaryReplay == 1``. The remaining live work is
+# not the numeric BinaryReplay category, but the private namespace/session/slot
+# setup the UI performs before BinaryReplay requests are accepted.
 
 CATEGORY_DIAGNOSTICS = 1
-CATEGORY_HANDSHAKE = 2          # tentative (see note above)
-CATEGORY_CONNECTION = 3         # tentative
-CATEGORY_DISCOVERY = 4          # tentative
-CATEGORY_DEVICE_INFO = 5        # tentative
-CATEGORY_SYSTEM_INFO = 6        # tentative
-CATEGORY_BINARY_REPLAY = 7      # tentative
-CATEGORY_WARPVIZ = 8            # tentative
+CATEGORY_SYSTEM_INFO = 2
+CATEGORY_DISCOVERY = 3
+CATEGORY_HANDSHAKE = 4
+CATEGORY_DEVICE_INFO = 5
+CATEGORY_CONNECTION = 6
+CATEGORY_LOCAL_DISCOVERY = 7
+
+CATEGORY_PYLON_BINARY_REPLAY = 1
+CATEGORY_BINARY_REPLAY = CATEGORY_PYLON_BINARY_REPLAY
+CATEGORY_WARPVIZ = 1  # WarpViz.proto has a separate category namespace too.
 
 
 # Channel IDs. ``read_header__sub_1409A3D40`` prints the channel as ``%u`` of
@@ -154,51 +143,80 @@ class TransportFrame:
 
 
 class RpcTransport:
-    """Synchronous TCP transport for the ngfx-rpc 8-byte framing.
+    """Synchronous transport for the ngfx-rpc 8-byte framing.
 
-    Use as a context manager (``with RpcTransport.connect(...) as t``) or
-    call :meth:`close` explicitly.
+    Supports both TCP and the named-pipe transport used by ngfx-ui. Use as a
+    context manager (``with RpcTransport.connect(...) as t``) or call
+    :meth:`close` explicitly.
     """
 
-    def __init__(self, sock: socket.socket) -> None:
+    def __init__(
+        self,
+        sock: socket.socket | None = None,
+        *,
+        pipe_handle: int | None = None,
+        pipe_name: str | None = None,
+    ) -> None:
         self._sock = sock
+        self._pipe_handle = pipe_handle
+        self._pipe_name = pipe_name
         self._lock = threading.Lock()
         self._closed = False
+        self._timeout: float | None = None
 
     @classmethod
-    def connect(cls, host: str, port: int, *, timeout: float = 5.0) -> "RpcTransport":
+    def connect(cls, host: str, port: int, *, timeout: float = 5.0) -> RpcTransport:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(timeout)
         s.connect((host, port))
         return cls(s)
 
+    @classmethod
+    def connect_named_pipe(cls, pipename: str, *, timeout: float = 5.0) -> RpcTransport:
+        """Connect to an ngfx-rpc named pipe such as ``{guid}``.
+
+        Nsight UI launches ngfx-rpc as ``--transport named-pipe --pipename
+        {guid}``. Windows exposes that endpoint at ``\\\\.\\pipe\\{guid}``.
+        """
+        handle = _open_named_pipe(pipename, timeout=timeout)
+        return cls(pipe_handle=handle, pipe_name=_normalise_pipe_name(pipename))
+
     def close(self) -> None:
         if self._closed:
             return
-        try:
-            self._sock.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
-        self._sock.close()
+        if self._sock is not None:
+            try:
+                self._sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            self._sock.close()
+        if self._pipe_handle is not None:
+            _close_named_pipe(self._pipe_handle)
         self._closed = True
 
-    def __enter__(self) -> "RpcTransport":
+    def __enter__(self) -> RpcTransport:
         return self
 
     def __exit__(self, *exc) -> None:
         self.close()
 
     def settimeout(self, t: float | None) -> None:
-        self._sock.settimeout(t)
+        self._timeout = t
+        if self._sock is not None:
+            self._sock.settimeout(t)
 
     # ---- low-level recv helpers ----------------------------------------
 
     def _recv_exact(self, n: int) -> bytes:
+        if self._pipe_handle is not None:
+            return _read_named_pipe_exact(self._pipe_handle, n)
+        if self._sock is None:
+            raise RpcProtocolError("transport is not connected")
         out = bytearray()
         while len(out) < n:
             try:
                 chunk = self._sock.recv(n - len(out))
-            except socket.timeout as e:
+            except TimeoutError as e:
                 raise RpcProtocolError(
                     f"timeout while reading {n} bytes (got {len(out)})"
                 ) from e
@@ -216,7 +234,12 @@ class RpcTransport:
     def send_frame(self, frame: TransportFrame) -> None:
         wire = frame.pack()
         with self._lock:
-            self._sock.sendall(wire)
+            if self._pipe_handle is not None:
+                _write_named_pipe_all(self._pipe_handle, wire)
+            elif self._sock is not None:
+                self._sock.sendall(wire)
+            else:
+                raise RpcProtocolError("transport is not connected")
 
     def recv_frame(self) -> TransportFrame:
         hdr = self._recv_exact(FRAME_HEADER_SIZE)
@@ -228,6 +251,86 @@ class RpcTransport:
             )
         body = self._recv_exact(body_size) if body_size else b""
         return TransportFrame(channel=channel, body=body, magic_0=magic_0, magic_1=magic_1, flag=flag)
+
+
+def _normalise_pipe_name(pipename: str) -> str:
+    text = str(pipename).strip()
+    if text.startswith("\\\\.\\pipe\\"):
+        return text
+    return f"\\\\.\\pipe\\{text}"
+
+
+def _open_named_pipe(pipename: str, *, timeout: float) -> int:
+    if os.name != "nt":
+        raise OSError("ngfx-rpc named-pipe transport is Windows-only")
+    path = _normalise_pipe_name(pipename)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = ctypes.c_void_p
+    wait_ms = max(1, int(timeout * 1000))
+    if not kernel32.WaitNamedPipeW(ctypes.c_wchar_p(path), ctypes.c_uint32(wait_ms)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    handle = kernel32.CreateFileW(
+        ctypes.c_wchar_p(path),
+        ctypes.c_uint32(0xC0000000),  # GENERIC_READ | GENERIC_WRITE
+        ctypes.c_uint32(0),
+        None,
+        ctypes.c_uint32(3),  # OPEN_EXISTING
+        ctypes.c_uint32(0),
+        None,
+    )
+    if handle in (None, ctypes.c_void_p(-1).value):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return int(handle)
+
+
+def _close_named_pipe(handle: int) -> None:
+    if os.name != "nt":
+        return
+    ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(ctypes.c_void_p(handle))
+
+
+def _read_named_pipe_exact(handle: int, n: int) -> bytes:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    out = bytearray()
+    while len(out) < n:
+        want = n - len(out)
+        buf = ctypes.create_string_buffer(want)
+        read = ctypes.c_uint32(0)
+        ok = kernel32.ReadFile(
+            ctypes.c_void_p(handle),
+            buf,
+            ctypes.c_uint32(want),
+            ctypes.byref(read),
+            None,
+        )
+        if not ok:
+            raise ctypes.WinError(ctypes.get_last_error())
+        if read.value == 0:
+            if not out:
+                raise RpcProtocolError("named pipe closed before any data")
+            raise RpcProtocolError(f"named pipe closed mid-frame ({len(out)}/{n} bytes received)")
+        out.extend(buf.raw[: read.value])
+    return bytes(out)
+
+
+def _write_named_pipe_all(handle: int, data: bytes) -> None:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    offset = 0
+    while offset < len(data):
+        chunk = ctypes.create_string_buffer(data[offset:])
+        written = ctypes.c_uint32(0)
+        ok = kernel32.WriteFile(
+            ctypes.c_void_p(handle),
+            chunk,
+            ctypes.c_uint32(len(data) - offset),
+            ctypes.byref(written),
+            None,
+        )
+        if not ok:
+            raise ctypes.WinError(ctypes.get_last_error())
+        if written.value == 0:
+            raise RpcProtocolError("named pipe write made no progress")
+        offset += written.value
 
 
 # ---------------------------------------------------------------------------
@@ -307,7 +410,7 @@ class RpcMessageHeader:
         return bytes(buf)
 
     @classmethod
-    def unpack(cls, b: bytes) -> "RpcMessageHeader":
+    def unpack(cls, b: bytes) -> RpcMessageHeader:
         if len(b) < MESSAGE_HEADER_WIRE_SIZE:
             raise RpcProtocolError(
                 f"wire header too short: {len(b)} < {MESSAGE_HEADER_WIRE_SIZE}"
@@ -336,7 +439,7 @@ class RpcMessage:
         return self.header.pack() + self.body
 
     @classmethod
-    def unpack(cls, b: bytes) -> "RpcMessage":
+    def unpack(cls, b: bytes) -> RpcMessage:
         hdr = RpcMessageHeader.unpack(b)
         return cls(header=hdr, body=b[MESSAGE_HEADER_WIRE_SIZE:])
 
@@ -430,8 +533,12 @@ class RpcClient:
     METHOD_EVENT_INFO = 14
     METHOD_EVENT_DETAILS = 16
     METHOD_API_INSPECTOR_STATE = 33
+    METHOD_IMAGE_SUBRESOURCE_DATA = 39
+    METHOD_RESOURCE_ACCESS_HISTORY = 53
+    METHOD_RESOURCE_INFO = 59
     METHOD_DESCRIPTOR_STATE = 63
     METHOD_ROOT_PARAMETERS = 67
+    METHOD_PIXEL_HISTORY = 70
 
     def launch_capture(self, capture_path: Path, **kwargs: Any) -> Any:
         req_cls = self.registry.message_class("NV.Pylon.Replay.PbLaunchRequest")
@@ -439,6 +546,8 @@ class RpcClient:
         # PbLaunchRequest has many fields — only set the ones we know are
         # required; the rest the caller can override via kwargs.
         # See PylonUi.proto for the full schema.
+        if hasattr(req, "captureFilePath"):
+            req.captureFilePath = str(capture_path)
         if hasattr(req, "capturePath"):
             req.capturePath = str(capture_path)
         for k, v in kwargs.items():
@@ -454,10 +563,14 @@ class RpcClient:
     def event_details(self, event_index: int, *, timeout: float = 10.0) -> Any:
         req_cls = self.registry.message_class("NV.Pylon.Replay.PbEventDetailsRequest")
         req = req_cls()
-        for fname in ("eventIndex", "EventIndex", "event_index", "index"):
-            if hasattr(req, fname):
-                setattr(req, fname, event_index)
-                break
+        if hasattr(req, "FirstEvent"):
+            req.FirstEvent = int(event_index)
+            req.EventCount = 1
+        else:
+            for fname in ("eventIndex", "EventIndex", "event_index", "index"):
+                if hasattr(req, fname):
+                    setattr(req, fname, event_index)
+                    break
         return self.call(
             category=CATEGORY_BINARY_REPLAY,
             method=self.METHOD_EVENT_DETAILS,
@@ -511,6 +624,305 @@ class RpcClient:
             timeout=timeout,
         )
 
+    def pixel_history(
+        self,
+        *,
+        image_accessor: int,
+        x: int,
+        y: int,
+        image_misc: int = 0,
+        image_view_accessor: int | None = None,
+        image_view_misc: int = 0,
+        aspect: int = 1,
+        mip_level: int = 0,
+        array_layer: int = 0,
+        slice_index: int = 0,
+        image_type: int = 3,
+        timeout: float = 30.0,
+    ) -> Any:
+        req = build_pixel_history_request(
+            self.registry,
+            image_accessor=image_accessor,
+            image_misc=image_misc,
+            image_view_accessor=image_view_accessor,
+            image_view_misc=image_view_misc,
+            x=x,
+            y=y,
+            aspect=aspect,
+            mip_level=mip_level,
+            array_layer=array_layer,
+            slice_index=slice_index,
+            image_type=image_type,
+        )
+        return self.call(
+            category=CATEGORY_BINARY_REPLAY,
+            method=self.METHOD_PIXEL_HISTORY,
+            request_proto=req,
+            reply_fqn="NV.Pylon.Replay.PbPixelHistoryReply",
+            timeout=timeout,
+        )
+
+    def resource_access_history(
+        self,
+        *,
+        accessor: int,
+        misc: int = 0,
+        timeout: float = 30.0,
+    ) -> Any:
+        req = build_resource_access_history_request(
+            self.registry,
+            accessor=accessor,
+            misc=misc,
+        )
+        return self.call(
+            category=CATEGORY_BINARY_REPLAY,
+            method=self.METHOD_RESOURCE_ACCESS_HISTORY,
+            request_proto=req,
+            reply_fqn="NV.Pylon.Replay.PbResourceAccessHistoryReply",
+            timeout=timeout,
+        )
+
+    def resource_info(
+        self,
+        *,
+        accessor: int,
+        misc: int = 0,
+        timeout: float = 30.0,
+    ) -> Any:
+        req = build_resource_info_request(self.registry, accessor=accessor, misc=misc)
+        return self.call(
+            category=CATEGORY_BINARY_REPLAY,
+            method=self.METHOD_RESOURCE_INFO,
+            request_proto=req,
+            reply_fqn="NV.Pylon.Replay.PbResourceInfoReply",
+            timeout=timeout,
+        )
+
+    def image_subresource_data(
+        self,
+        *,
+        accessor: int,
+        event_index: int,
+        misc: int = 0,
+        aspect: int = 1,
+        mip_level: int = 0,
+        array_layer: int = 0,
+        slice_index: int = 0,
+        region: dict[str, int] | None = None,
+        timeout: float = 60.0,
+    ) -> Any:
+        req = build_image_subresource_data_request(
+            self.registry,
+            accessor=accessor,
+            misc=misc,
+            event_index=event_index,
+            aspect=aspect,
+            mip_level=mip_level,
+            array_layer=array_layer,
+            slice_index=slice_index,
+            region=region,
+        )
+        return self.call(
+            category=CATEGORY_BINARY_REPLAY,
+            method=self.METHOD_IMAGE_SUBRESOURCE_DATA,
+            request_proto=req,
+            reply_fqn="NV.Pylon.Replay.PbImageSubresourceDataReply",
+            timeout=timeout,
+        )
+
+
+def protobuf_to_dict(message: Any) -> dict[str, Any]:
+    """Convert a dynamic protobuf message to a JSON-safe dict."""
+    return MessageToDict(
+        message,
+        preserving_proto_field_name=True,
+        use_integers_for_enums=True,
+    )
+
+
+def _api_data_handle(
+    registry: proto_descriptors.SchemaRegistry,
+    *,
+    accessor: int,
+    misc: int = 0,
+) -> Any:
+    cls = registry.message_class("NV.PbApiDataHandle")
+    msg = cls()
+    msg.Accessor = int(accessor)
+    msg.Misc = int(misc)
+    return msg
+
+
+def _image_subresource(
+    registry: proto_descriptors.SchemaRegistry,
+    *,
+    aspect: int = 1,
+    mip_level: int = 0,
+    array_layer: int = 0,
+    slice_index: int = 0,
+) -> Any:
+    cls = registry.message_class("NV.PbImageSubresource")
+    msg = cls()
+    msg.aspect = int(aspect)
+    msg.mipLevel = int(mip_level)
+    msg.arrayLayer = int(array_layer)
+    msg.slice = int(slice_index)
+    return msg
+
+
+def _offset2d(
+    registry: proto_descriptors.SchemaRegistry,
+    *,
+    x: int,
+    y: int,
+) -> Any:
+    cls = registry.message_class("NV.PbOffset2D")
+    msg = cls()
+    msg.x = int(x)
+    msg.y = int(y)
+    return msg
+
+
+def build_pixel_history_request(
+    registry: proto_descriptors.SchemaRegistry,
+    *,
+    image_accessor: int,
+    x: int,
+    y: int,
+    image_misc: int = 0,
+    image_view_accessor: int | None = None,
+    image_view_misc: int = 0,
+    aspect: int = 1,
+    mip_level: int = 0,
+    array_layer: int = 0,
+    slice_index: int = 0,
+    image_type: int = 3,
+) -> Any:
+    req_cls = registry.message_class("NV.Pylon.Replay.PbPixelHistoryRequest")
+    req = req_cls()
+    image = _api_data_handle(registry, accessor=image_accessor, misc=image_misc)
+    req.ImageView.image.CopyFrom(image)
+    view_accessor = image_accessor if image_view_accessor is None else image_view_accessor
+    view = _api_data_handle(registry, accessor=view_accessor, misc=image_view_misc)
+    req.ImageView.imageView.CopyFrom(view)
+    req.ImageView.imageType = int(image_type)
+    req.ImageView.baseMipLevel = int(mip_level)
+    req.ImageView.mipLevelCount = 1
+    req.ImageView.baseArrayLayer = int(array_layer)
+    req.ImageView.arrayLayerCount = 1
+    req.Subresource.CopyFrom(
+        _image_subresource(
+            registry,
+            aspect=aspect,
+            mip_level=mip_level,
+            array_layer=array_layer,
+            slice_index=slice_index,
+        )
+    )
+    req.Pixel.CopyFrom(_offset2d(registry, x=x, y=y))
+    return req
+
+
+def build_resource_access_history_request(
+    registry: proto_descriptors.SchemaRegistry,
+    *,
+    accessor: int,
+    misc: int = 0,
+) -> Any:
+    req_cls = registry.message_class("NV.Pylon.Replay.PbResourceAccessHistoryRequest")
+    req = req_cls()
+    req.Object.CopyFrom(_api_data_handle(registry, accessor=accessor, misc=misc))
+    return req
+
+
+def build_resource_info_request(
+    registry: proto_descriptors.SchemaRegistry,
+    *,
+    accessor: int,
+    misc: int = 0,
+) -> Any:
+    req_cls = registry.message_class("NV.Pylon.Replay.PbResourceInfoRequest")
+    req = req_cls()
+    req.Object.CopyFrom(_api_data_handle(registry, accessor=accessor, misc=misc))
+    return req
+
+
+def build_image_subresource_data_request(
+    registry: proto_descriptors.SchemaRegistry,
+    *,
+    accessor: int,
+    event_index: int,
+    misc: int = 0,
+    aspect: int = 1,
+    mip_level: int = 0,
+    array_layer: int = 0,
+    slice_index: int = 0,
+    region: dict[str, int] | None = None,
+) -> Any:
+    req_cls = registry.message_class("NV.Pylon.Replay.PbImageSubresourceDataRequest")
+    req = req_cls()
+    req.object.CopyFrom(_api_data_handle(registry, accessor=accessor, misc=misc))
+    req.subresource.CopyFrom(
+        _image_subresource(
+            registry,
+            aspect=aspect,
+            mip_level=mip_level,
+            array_layer=array_layer,
+            slice_index=slice_index,
+        )
+    )
+    req.eventIndex = int(event_index)
+    if region:
+        _populate_region(req.region, region)
+    return req
+
+
+def resource_revision_from_history(history_reply: Any, event_index: int) -> dict[str, Any]:
+    """Select the last resource access at or before ``event_index``."""
+    reply_dict = protobuf_to_dict(history_reply)
+    history = reply_dict.get("History") or reply_dict.get("history") or {}
+    accesses = history.get("Accesses") or history.get("accesses") or []
+    normalised: list[dict[str, Any]] = []
+    for access in accesses:
+        ev = access.get("EventIndex", access.get("eventIndex"))
+        try:
+            ev_int = int(ev)
+        except (TypeError, ValueError):
+            continue
+        item = dict(access)
+        item["event_index"] = ev_int
+        normalised.append(item)
+    before = [a for a in normalised if a["event_index"] <= int(event_index)]
+    after = [a for a in normalised if a["event_index"] > int(event_index)]
+    chosen = max(before, key=lambda a: a["event_index"]) if before else None
+    return {
+        "requested_event_index": int(event_index),
+        "access_count": len(normalised),
+        "revision_at_or_before_event": chosen,
+        "next_access_after_event": min(after, key=lambda a: a["event_index"]) if after else None,
+        "all_accesses": normalised,
+    }
+
+
+def _populate_region(region_msg: Any, region: dict[str, int]) -> None:
+    """Best-effort fill for PbImageRegion without hard-coding all schema variants."""
+    for key, value in region.items():
+        if hasattr(region_msg, key):
+            setattr(region_msg, key, int(value))
+    # Common nested shapes, depending on Nsight schema version.
+    for outer, inner in (
+        ("offset", ("x", "y", "z")),
+        ("extent", ("width", "height", "depth")),
+        ("Offset", ("x", "y", "z")),
+        ("Extent", ("width", "height", "depth")),
+    ):
+        if not hasattr(region_msg, outer):
+            continue
+        nested = getattr(region_msg, outer)
+        for key in inner:
+            if key in region and hasattr(nested, key):
+                setattr(nested, key, int(region[key]))
+
 
 # ---------------------------------------------------------------------------
 # Connection-string helpers
@@ -536,6 +948,43 @@ def find_listening_port(pid: int, timeout: float = 5.0,
             return port
         time.sleep(poll_interval)
     raise TimeoutError(f"no listening port for pid {pid} within {timeout}s")
+
+
+def named_pipe_from_process(pid: int) -> str | None:
+    """Return ``--pipename`` from an ngfx-rpc process command line, if present."""
+    try:
+        import psutil
+
+        cmdline = psutil.Process(int(pid)).cmdline()
+    except (ImportError, ValueError):
+        return None
+    except Exception:
+        return None
+    for index, token in enumerate(cmdline):
+        if token == "--pipename" and index + 1 < len(cmdline):
+            return cmdline[index + 1]
+        if token.startswith("--pipename="):
+            return token.split("=", 1)[1]
+    return None
+
+
+def resolve_process_endpoint(pid: int, *, timeout: float = 5.0) -> dict[str, Any]:
+    """Resolve a running ngfx-rpc process to a TCP or named-pipe endpoint."""
+    try:
+        port = find_listening_port(pid, timeout=timeout)
+        return {"transport": "tcp", "host": "127.0.0.1", "port": port, "pid": int(pid)}
+    except TimeoutError as tcp_error:
+        pipename = named_pipe_from_process(pid)
+        if pipename:
+            return {
+                "transport": "named_pipe",
+                "host": "127.0.0.1",
+                "port": 0,
+                "pipename": pipename,
+                "pid": int(pid),
+                "tcp_probe_error": str(tcp_error),
+            }
+        return {"transport": "unknown", "pid": int(pid), "error": str(tcp_error)}
 
 
 def _list_listening_ports_for_pid(pid: int) -> int | None:

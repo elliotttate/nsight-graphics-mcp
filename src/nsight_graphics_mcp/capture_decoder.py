@@ -88,11 +88,12 @@ guarantees, use the JSON-backed metadata tools (``ngfx_capture_summary``,
 
 from __future__ import annotations
 
+import hashlib
 import struct
-from dataclasses import dataclass, field
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Iterator
-
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # Container constants
@@ -123,7 +124,7 @@ class CaptureHeader:
     file_size: int
     magic_prefix: bytes
     magic_prefix_ok: bool
-    first_chunk: "ChunkHeader"
+    first_chunk: ChunkHeader
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -793,3 +794,447 @@ def event_args(path: Path, event_index: int) -> dict[str, Any] | None:
     if not result["events"]:
         return None
     return result["events"][0]
+
+
+def search_payloads(
+    path: Path,
+    needles: Iterable[str],
+    *,
+    max_chunks: int | None = None,
+    max_chunk_uncompressed: int = 32 * 1024 * 1024,
+    max_hits: int = 100,
+    context_bytes: int = 96,
+) -> dict[str, Any]:
+    """Search decompressed capture chunk payloads for strings or hex bytes.
+
+    This is intentionally lower-level than ``metadata-objects``. It answers
+    "does the saved dump contain CopyRectPS / this shader hash anywhere?" even
+    when Nsight's public metadata stream does not expose the object mapping.
+    """
+    compiled = _compile_needles(needles)
+    if not compiled:
+        return {"ok": False, "error": "supply at least one non-empty needle"}
+
+    hits: list[dict[str, Any]] = []
+    chunks_scanned = 0
+    chunks_skipped = 0
+    errors: list[dict[str, Any]] = []
+    for header in iter_chunk_headers(path, max_chunks=max_chunks):
+        if len(hits) >= max_hits:
+            break
+        if header.uncompressed_size > max_chunk_uncompressed:
+            chunks_skipped += 1
+            continue
+        chunks_scanned += 1
+        try:
+            payload = decompress_chunk(path, header)
+        except Exception as exc:
+            chunks_skipped += 1
+            if len(errors) < 20:
+                errors.append(
+                    {
+                        "chunk_index": header.index,
+                        "chunk_id": header.kind,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+            continue
+        payload_lower = payload.lower()
+        for needle in compiled:
+            haystack = payload_lower if needle["case_insensitive"] else payload
+            pos = haystack.find(needle["bytes"])
+            while pos >= 0:
+                start = max(0, pos - context_bytes)
+                end = min(len(payload), pos + len(needle["bytes"]) + context_bytes)
+                snippet = payload[start:end]
+                hits.append(
+                    {
+                        "needle": needle["label"],
+                        "needle_kind": needle["kind"],
+                        "chunk": header.to_dict(),
+                        "payload_offset": pos,
+                        "context_hex": snippet.hex(),
+                        "context_ascii": _ascii_preview(snippet),
+                    }
+                )
+                if len(hits) >= max_hits:
+                    break
+                pos = haystack.find(needle["bytes"], pos + max(1, len(needle["bytes"])))
+            if len(hits) >= max_hits:
+                break
+    return {
+        "ok": True,
+        "path": str(path),
+        "needles": [item["label"] for item in compiled],
+        "chunks_scanned": chunks_scanned,
+        "chunks_skipped": chunks_skipped,
+        "hit_count": len(hits),
+        "hits": hits,
+        "errors": errors,
+        "notes": [
+            "A hit proves the bytes exist somewhere in the saved capture, not which event used them.",
+            "Pair hits with GPU Trace shader pipeline search or live replay RPC for exact event/resource provenance.",
+        ],
+    }
+
+
+def shader_chunks(
+    path: Path,
+    *,
+    shader_name: str | None = None,
+    shader_hash: str | None = None,
+    max_chunks: int | None = None,
+    max_chunk_uncompressed: int = 64 * 1024 * 1024,
+    max_hits: int = 200,
+    max_strings: int = 80,
+) -> dict[str, Any]:
+    """Find DXBC/DXIL shader blobs embedded in capture chunks."""
+    wanted_name = shader_name.lower() if shader_name else None
+    wanted_hash = _normalise_hash(shader_hash) if shader_hash else None
+    records: list[dict[str, Any]] = []
+    chunks_scanned = 0
+    chunks_skipped = 0
+    for header in iter_chunk_headers(path, max_chunks=max_chunks):
+        if len(records) >= max_hits:
+            break
+        if header.uncompressed_size > max_chunk_uncompressed:
+            chunks_skipped += 1
+            continue
+        chunks_scanned += 1
+        try:
+            payload = decompress_chunk(path, header)
+        except Exception:
+            chunks_skipped += 1
+            continue
+        lower = payload.lower()
+        dxbc_offsets = _all_offsets(payload, b"DXBC")
+        if not dxbc_offsets and b"dxil" not in lower:
+            continue
+        strings = _ascii_strings(payload, limit=max_strings)
+        hash_details = _shader_hash_details(payload, dxbc_offsets)
+        hash_candidates = set(hash_details["dxbc_hashes"]) | set(hash_details["sha1_hashes"])
+        reasons: list[str] = []
+        if wanted_name and any(wanted_name in item.lower() for item in strings):
+            reasons.append("shader_name_string")
+        if wanted_hash and wanted_hash in hash_candidates:
+            reasons.append("shader_hash")
+        if wanted_name or wanted_hash:
+            if not reasons:
+                continue
+        records.append(
+            {
+                "chunk": header.to_dict(),
+                "dxbc_offsets": dxbc_offsets,
+                "dxil_offsets": _all_offsets(payload, b"DXIL"),
+                "hash_candidates": sorted(hash_candidates),
+                "dxbc_hashes": hash_details["dxbc_hashes"],
+                "sha1_hashes": hash_details["sha1_hashes"],
+                "payload_sha1": hash_details["payload_sha1"],
+                "strings": strings,
+                "name_like_strings": _shader_name_like_strings(strings),
+                "pdb_paths": [item for item in strings if item.lower().endswith(".pdb")],
+                "match_reasons": reasons,
+            }
+        )
+    return {
+        "ok": True,
+        "path": str(path),
+        "filters": {"shader_name": shader_name, "shader_hash": shader_hash},
+        "chunks_scanned": chunks_scanned,
+        "chunks_skipped": chunks_skipped,
+        "record_count": len(records),
+        "records": records,
+        "notes": [
+            "DXBC header hash is the 16 bytes after the DXBC magic; SHA-1 candidates are also included.",
+            "This maps shader names/hashes to capture chunk IDs, not directly to draw events.",
+        ],
+    }
+
+
+def chunk_references(
+    path: Path,
+    *,
+    target_chunk_id: int | None = None,
+    needles: Iterable[str] | None = None,
+    include_numeric_chunk_id_refs: bool = True,
+    exclude_chunk_ids: Iterable[int] | None = None,
+    max_chunks: int | None = None,
+    max_chunk_uncompressed: int = 32 * 1024 * 1024,
+    max_hits: int = 200,
+    context_bytes: int = 96,
+) -> dict[str, Any]:
+    """Search capture chunks for references to a chunk id or arbitrary bytes.
+
+    This is a saved-dump graph builder: after ``shader_chunks`` finds a DXBC
+    blob chunk, this tool can ask "does any other chunk mention that chunk id,
+    shader hash, PDB path, or shader name?" Hits are byte-level evidence, not
+    decoded schema fields, but they are often enough to locate the next private
+    table to reverse.
+    """
+    patterns = _reference_patterns(
+        target_chunk_id,
+        needles or [],
+        include_numeric_chunk_id_refs=include_numeric_chunk_id_refs,
+    )
+    if not patterns:
+        return {"ok": False, "error": "supply target_chunk_id or at least one needle"}
+    excluded = {int(value) for value in (exclude_chunk_ids or [])}
+    hits: list[dict[str, Any]] = []
+    chunks_scanned = 0
+    chunks_skipped = 0
+    errors: list[dict[str, Any]] = []
+
+    for header in iter_chunk_headers(path, max_chunks=max_chunks):
+        if len(hits) >= max_hits:
+            break
+        if header.kind in excluded:
+            chunks_skipped += 1
+            continue
+        if header.uncompressed_size > max_chunk_uncompressed:
+            chunks_skipped += 1
+            continue
+        chunks_scanned += 1
+        try:
+            payload = decompress_chunk(path, header)
+        except Exception as exc:
+            chunks_skipped += 1
+            if len(errors) < 20:
+                errors.append(
+                    {
+                        "chunk_index": header.index,
+                        "chunk_id": header.kind,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+            continue
+        payload_lower = payload.lower()
+        for pattern in patterns:
+            haystack = payload_lower if pattern["case_insensitive"] else payload
+            pos = haystack.find(pattern["bytes"])
+            while pos >= 0:
+                start = max(0, pos - context_bytes)
+                end = min(len(payload), pos + len(pattern["bytes"]) + context_bytes)
+                snippet = payload[start:end]
+                hits.append(
+                    {
+                        "target_chunk_id": target_chunk_id,
+                        "needle": pattern["label"],
+                        "reference_kind": pattern["kind"],
+                        "chunk": header.to_dict(),
+                        "payload_offset": pos,
+                        "context_hex": snippet.hex(),
+                        "context_ascii": _ascii_preview(snippet),
+                    }
+                )
+                if len(hits) >= max_hits:
+                    break
+                pos = haystack.find(pattern["bytes"], pos + max(1, len(pattern["bytes"])))
+            if len(hits) >= max_hits:
+                break
+
+    external_hits = [
+        hit
+        for hit in hits
+        if target_chunk_id is None or hit["chunk"]["kind"] != target_chunk_id
+    ]
+    return {
+        "ok": True,
+        "path": str(path),
+        "target_chunk_id": target_chunk_id,
+        "include_numeric_chunk_id_refs": include_numeric_chunk_id_refs,
+        "needles": [pattern["label"] for pattern in patterns],
+        "excluded_chunk_ids": sorted(excluded),
+        "chunks_scanned": chunks_scanned,
+        "chunks_skipped": chunks_skipped,
+        "hit_count": len(hits),
+        "external_hit_count": len(external_hits),
+        "hits": hits,
+        "errors": errors,
+        "notes": [
+            "Numeric chunk-id hits are candidate references; private schemas still need decoding to prove field meaning.",
+            "Use exclude_chunk_ids=[target_chunk_id] to suppress self-matches from the source shader chunk.",
+        ],
+    }
+
+
+def _compile_needles(needles: Iterable[str]) -> list[dict[str, Any]]:
+    compiled: list[dict[str, Any]] = []
+    seen: set[tuple[str, bytes]] = set()
+    for raw in needles:
+        text = str(raw).strip()
+        if not text:
+            continue
+        text_bytes = text.lower().encode("utf-8", errors="replace")
+        key = ("text", text_bytes)
+        if key not in seen:
+            seen.add(key)
+            compiled.append(
+                {
+                    "label": text,
+                    "kind": "text",
+                    "bytes": text_bytes,
+                    "case_insensitive": True,
+                }
+            )
+        hex_text = text.lower().removeprefix("0x").replace(" ", "")
+        if len(hex_text) >= 4 and len(hex_text) % 2 == 0:
+            try:
+                binary = bytes.fromhex(hex_text)
+            except ValueError:
+                continue
+            key = ("hex", binary)
+            if key not in seen:
+                seen.add(key)
+                compiled.append(
+                    {
+                        "label": text,
+                        "kind": "hex_bytes",
+                        "bytes": binary,
+                        "case_insensitive": False,
+                    }
+                )
+    return compiled
+
+
+def _reference_patterns(
+    target_chunk_id: int | None,
+    needles: Iterable[str],
+    *,
+    include_numeric_chunk_id_refs: bool,
+) -> list[dict[str, Any]]:
+    patterns = _compile_needles(needles)
+    if target_chunk_id is None or not include_numeric_chunk_id_refs:
+        return patterns
+    chunk_id = int(target_chunk_id)
+    numeric: list[dict[str, Any]] = [
+        {
+            "label": str(chunk_id),
+            "kind": "chunk_id_u32_le",
+            "bytes": chunk_id.to_bytes(4, "little", signed=False),
+            "case_insensitive": False,
+        },
+        {
+            "label": str(chunk_id),
+            "kind": "chunk_id_u64_le",
+            "bytes": chunk_id.to_bytes(8, "little", signed=False),
+            "case_insensitive": False,
+        },
+        {
+            "label": str(chunk_id),
+            "kind": "chunk_id_u32_be",
+            "bytes": chunk_id.to_bytes(4, "big", signed=False),
+            "case_insensitive": False,
+        },
+        {
+            "label": str(chunk_id),
+            "kind": "chunk_id_u64_be",
+            "bytes": chunk_id.to_bytes(8, "big", signed=False),
+            "case_insensitive": False,
+        },
+        {
+            "label": str(chunk_id),
+            "kind": "chunk_id_ascii_decimal",
+            "bytes": str(chunk_id).encode("ascii"),
+            "case_insensitive": False,
+        },
+        {
+            "label": hex(chunk_id),
+            "kind": "chunk_id_ascii_hex",
+            "bytes": hex(chunk_id).encode("ascii"),
+            "case_insensitive": True,
+        },
+    ]
+    seen = {(pattern["kind"], pattern["bytes"]) for pattern in patterns}
+    for pattern in numeric:
+        key = (pattern["kind"], pattern["bytes"])
+        if key not in seen:
+            seen.add(key)
+            patterns.append(pattern)
+    return patterns
+
+
+def _normalise_hash(value: str | None) -> str | None:
+    if value is None:
+        return None
+    text = value.strip().lower().removeprefix("0x").replace(" ", "")
+    return text or None
+
+
+def _all_offsets(payload: bytes, needle: bytes) -> list[int]:
+    offsets: list[int] = []
+    pos = payload.find(needle)
+    while pos >= 0:
+        offsets.append(pos)
+        pos = payload.find(needle, pos + 1)
+    return offsets
+
+
+def _shader_hash_details(payload: bytes, dxbc_offsets: list[int]) -> dict[str, Any]:
+    dxbc_hashes: set[str] = set()
+    sha1_hashes: set[str] = {hashlib.sha1(payload).hexdigest()}
+    for offset in dxbc_offsets:
+        if offset + 20 <= len(payload):
+            dxbc_hashes.add(payload[offset + 4:offset + 20].hex())
+        sha1_hashes.add(hashlib.sha1(payload[offset:]).hexdigest())
+    return {
+        "dxbc_hashes": sorted(dxbc_hashes),
+        "sha1_hashes": sorted(sha1_hashes),
+        "payload_sha1": hashlib.sha1(payload).hexdigest(),
+    }
+
+
+_COMMON_SHADER_STRINGS = {
+    "DXBC",
+    "DXIL",
+    "HASH",
+    "ISG1",
+    "OSG1",
+    "PCSG",
+    "PRIV",
+    "PSV0",
+    "RDAT",
+    "SFI0",
+    "SHDR",
+    "STAT",
+    "SV_Target",
+    "TEXCOORD",
+}
+
+
+def _shader_name_like_strings(strings: list[str]) -> list[str]:
+    out: list[str] = []
+    for item in strings:
+        text = item.strip()
+        if not text or text in _COMMON_SHADER_STRINGS:
+            continue
+        if text.startswith("SV_") or text.lower().endswith(".pdb"):
+            continue
+        if not any(ch.isalpha() for ch in text):
+            continue
+        if not all(ch.isalnum() or ch in "_$.:/-" for ch in text):
+            continue
+        if len(text) > 128:
+            continue
+        out.append(text)
+    return out
+
+
+def _ascii_strings(payload: bytes, *, limit: int) -> list[str]:
+    strings: list[str] = []
+    current = bytearray()
+    for byte in payload:
+        if 32 <= byte < 127:
+            current.append(byte)
+            continue
+        if len(current) >= 4:
+            strings.append(current.decode("latin-1", errors="replace"))
+            if len(strings) >= limit:
+                break
+        current.clear()
+    if len(strings) < limit and len(current) >= 4:
+        strings.append(current.decode("latin-1", errors="replace"))
+    return strings
+
+
+def _ascii_preview(data: bytes) -> str:
+    return "".join(chr(byte) if 32 <= byte < 127 else "." for byte in data)

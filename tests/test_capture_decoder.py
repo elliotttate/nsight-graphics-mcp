@@ -17,7 +17,6 @@ import pytest
 from nsight_graphics_mcp import capture_decoder as cd
 from nsight_graphics_mcp.config import host_bin_dir
 
-
 # ---------------------------------------------------------------------------
 # Discovery helpers
 # ---------------------------------------------------------------------------
@@ -169,6 +168,80 @@ def test_decompress_chunk_roundtrip_synthetic(tmp_path: Path) -> None:
     assert out_lz4 == payload_lz4
     out_raw = cd.decompress_chunk(p, headers[1])
     assert out_raw == payload_raw
+
+
+def test_search_payloads_synthetic(tmp_path: Path) -> None:
+    p = tmp_path / "fake.ngfx-capture"
+    payload = b"prefix CopyRectPS shader hash 98acf00f2001c218 suffix"
+    raw_hash = bytes.fromhex("98acf00f2001c218")
+    capture = _build_capture([(1, 100, payload), (0, 200, b"\x00" + raw_hash + b"\x01")])
+    p.write_bytes(capture)
+
+    result = cd.search_payloads(p, ["CopyRectPS", "98acf00f2001c218"])
+
+    assert result["ok"]
+    assert result["hit_count"] >= 3
+    kinds = {hit["needle_kind"] for hit in result["hits"]}
+    assert "text" in kinds
+    assert "hex_bytes" in kinds
+
+
+def test_shader_chunks_synthetic(tmp_path: Path) -> None:
+    p = tmp_path / "fake.ngfx-capture"
+    dxbc_hash = bytes.fromhex("529845b997ed9c43ad87a3a1432fd393")
+    payload = b"DXBC" + dxbc_hash + b"\x00" * 32 + b"TEXCOORD\x00CopyRectPS\x00DXIL"
+    capture = _build_capture([(1, 100, payload)])
+    p.write_bytes(capture)
+
+    result = cd.shader_chunks(
+        p,
+        shader_name="CopyRectPS",
+        shader_hash="529845b997ed9c43ad87a3a1432fd393",
+    )
+
+    assert result["ok"]
+    assert result["record_count"] == 1
+    record = result["records"][0]
+    assert record["chunk"]["kind"] == 100
+    assert record["dxbc_offsets"] == [0]
+    assert "529845b997ed9c43ad87a3a1432fd393" in record["hash_candidates"]
+    assert record["dxbc_hashes"] == ["529845b997ed9c43ad87a3a1432fd393"]
+    assert record["payload_sha1"] in record["sha1_hashes"]
+    assert "CopyRectPS" in record["name_like_strings"]
+    assert set(record["match_reasons"]) == {"shader_name_string", "shader_hash"}
+
+
+def test_chunk_references_synthetic(tmp_path: Path) -> None:
+    p = tmp_path / "fake.ngfx-capture"
+    shader_payload = b"DXBC" + (b"\x11" * 16) + b"\x00CopyRectPS\x00"
+    ref_payload = b"refs:" + struct.pack("<I", 100) + b":CopyRectPS"
+    capture = _build_capture([(1, 100, shader_payload), (1, 200, ref_payload)])
+    p.write_bytes(capture)
+
+    result = cd.chunk_references(
+        p,
+        target_chunk_id=100,
+        needles=["CopyRectPS"],
+        exclude_chunk_ids=[100],
+    )
+
+    assert result["ok"]
+    assert result["hit_count"] >= 2
+    assert result["external_hit_count"] == result["hit_count"]
+    hit_kinds = {hit["reference_kind"] for hit in result["hits"]}
+    assert "chunk_id_u32_le" in hit_kinds
+    assert "text" in hit_kinds
+    assert {hit["chunk"]["kind"] for hit in result["hits"]} == {200}
+
+    text_only = cd.chunk_references(
+        p,
+        target_chunk_id=100,
+        needles=["CopyRectPS"],
+        include_numeric_chunk_id_refs=False,
+        exclude_chunk_ids=[100],
+    )
+    assert text_only["hit_count"] == 1
+    assert text_only["hits"][0]["reference_kind"] == "text"
 
 
 def test_chunk_summary_synthetic(tmp_path: Path) -> None:

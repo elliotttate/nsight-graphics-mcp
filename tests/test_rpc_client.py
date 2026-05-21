@@ -18,7 +18,6 @@ import socket
 import struct
 import subprocess
 import threading
-import time
 from pathlib import Path
 
 import pytest
@@ -27,7 +26,6 @@ from nsight_graphics_mcp import proto_descriptors as pd
 from nsight_graphics_mcp import rpc_client
 from nsight_graphics_mcp.config import host_bin_dir
 from nsight_graphics_mcp.rpc_client import (
-    DEFAULT_CHANNEL,
     FRAME_HEADER_SIZE,
     FRAME_MAGIC_0,
     FRAME_MAGIC_1,
@@ -38,7 +36,6 @@ from nsight_graphics_mcp.rpc_client import (
     RpcTransport,
     TransportFrame,
 )
-
 
 # ---------------------------------------------------------------------------
 # Unit tests — always run
@@ -241,8 +238,62 @@ def test_binary_replay_method_enum_pinned_values() -> None:
     assert by_name["MethodEventInfoRequest"] == rpc_client.RpcClient.METHOD_EVENT_INFO == 14
     assert by_name["MethodEventDetailsRequest"] == rpc_client.RpcClient.METHOD_EVENT_DETAILS == 16
     assert by_name["MethodApiInspectorStateRequest"] == rpc_client.RpcClient.METHOD_API_INSPECTOR_STATE == 33
+    assert by_name["MethodImageSubresourceDataRequest"] == rpc_client.RpcClient.METHOD_IMAGE_SUBRESOURCE_DATA == 39
+    assert by_name["MethodResourceAccessHistoryRequest"] == rpc_client.RpcClient.METHOD_RESOURCE_ACCESS_HISTORY == 53
+    assert by_name["MethodResourceInfoRequest"] == rpc_client.RpcClient.METHOD_RESOURCE_INFO == 59
     assert by_name["MethodDescriptorStateRequest"] == rpc_client.RpcClient.METHOD_DESCRIPTOR_STATE == 63
     assert by_name["MethodRootParametersRequest"] == rpc_client.RpcClient.METHOD_ROOT_PARAMETERS == 67
+    assert by_name["MethodPixelHistoryRequest"] == rpc_client.RpcClient.METHOD_PIXEL_HISTORY == 70
+
+
+@needs_install
+def test_pixel_history_request_builder() -> None:
+    reg = pd.build_registry(RPC_EXE)
+    req = rpc_client.build_pixel_history_request(
+        reg,
+        image_accessor=123,
+        image_misc=4,
+        image_view_accessor=456,
+        image_view_misc=7,
+        x=10,
+        y=20,
+        mip_level=2,
+        array_layer=3,
+    )
+
+    assert req.ImageView.image.Accessor == 123
+    assert req.ImageView.image.Misc == 4
+    assert req.ImageView.imageView.Accessor == 456
+    assert req.Subresource.mipLevel == 2
+    assert req.Subresource.arrayLayer == 3
+    assert req.Pixel.x == 10
+    assert req.Pixel.y == 20
+    assert req.SerializeToString()
+
+
+@needs_install
+def test_resource_access_history_request_builder_and_revision_selection() -> None:
+    reg = pd.build_registry(RPC_EXE)
+    req = rpc_client.build_resource_access_history_request(reg, accessor=99, misc=12)
+    assert req.Object.Accessor == 99
+    assert req.Object.Misc == 12
+
+    reply_cls = reg.message_class("NV.Pylon.Replay.PbResourceAccessHistoryReply")
+    reply = reply_cls()
+    first = reply.History.Accesses.add()
+    first.EventIndex = 10
+    first.AccessFlags = 1
+    second = reply.History.Accesses.add()
+    second.EventIndex = 25
+    second.AccessFlags = 2
+    third = reply.History.Accesses.add()
+    third.EventIndex = 40
+    third.AccessFlags = 4
+
+    rev = rpc_client.resource_revision_from_history(reply, 30)
+    assert rev["revision_at_or_before_event"]["event_index"] == 25
+    assert rev["next_access_after_event"]["event_index"] == 40
+    assert rev["access_count"] == 3
 
 
 @needs_install
@@ -253,6 +304,27 @@ def test_diagnostics_method_databuffer_is_six() -> None:
     method_enum = next(et for et in fd.enum_type if et.name == "DiagnosticsMethod")
     by_name = {v.name: v.number for v in method_enum.value}
     assert by_name["DataBuffer"] == 6
+
+
+@needs_install
+def test_rpc_category_ids_are_pinned_from_proto_enums() -> None:
+    reg = pd.build_registry(RPC_EXE)
+
+    system_fd = reg.files["SystemCategories.proto"]
+    system_enum = next(et for et in system_fd.enum_type if et.name == "SystemCategory")
+    system = {v.name: v.number for v in system_enum.value}
+    assert system["CategoryDiagnostics"] == rpc_client.CATEGORY_DIAGNOSTICS == 1
+    assert system["CategorySystemInfo"] == rpc_client.CATEGORY_SYSTEM_INFO == 2
+    assert system["CategoryDiscovery"] == rpc_client.CATEGORY_DISCOVERY == 3
+    assert system["CategoryHandshake"] == rpc_client.CATEGORY_HANDSHAKE == 4
+    assert system["CategoryDeviceInfo"] == rpc_client.CATEGORY_DEVICE_INFO == 5
+    assert system["CategoryConnection"] == rpc_client.CATEGORY_CONNECTION == 6
+    assert system["CategoryLocalDiscovery"] == rpc_client.CATEGORY_LOCAL_DISCOVERY == 7
+
+    pylon_fd = reg.files["PylonUi.proto"]
+    pylon_enum = next(et for et in pylon_fd.enum_type if et.name == "Category")
+    pylon = {v.name: v.number for v in pylon_enum.value}
+    assert pylon["CategoryBinaryReplay"] == rpc_client.CATEGORY_BINARY_REPLAY == 1
 
 
 @needs_install

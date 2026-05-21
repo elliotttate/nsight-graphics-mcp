@@ -45,9 +45,15 @@ you can poll with `ngfx_launch_status` and terminate with
 
 | Tool | What it does |
 | --- | --- |
-| `ngfx_capture_launched` | Run `ngfx-capture.exe` directly. Produces a `.ngfx-gfxcap` with a bundled replayer. Supports all triggers, compression, HVVM modes, delimiter modes, troubleshooting knobs, and ray-tracing options from `ngfx-capture --help`. |
+| `ngfx_capture_launched` | Run `ngfx-capture.exe` directly. Produces a `.ngfx-capture` / `.ngfx-gfxcap` with a bundled replayer. Supports all triggers, compression, HVVM modes, delimiter modes, troubleshooting knobs, and ray-tracing options from `ngfx-capture --help`. |
 | `ngfx_capture_recapture` | `--recapture` an existing capture with current format. |
 | `ngfx_capture_recompress` | `--recompress` for higher compression / format upgrades. |
+
+### Deep Nsight-only capture capability report
+
+| Tool | What it does |
+| --- | --- |
+| `ngfx_deep_capture_capability_report` | Inspect the selected Nsight install, SDK headers, relevant plugins, optional capture path, and CLI help to rank the deepest available Nsight-only path for shader/render debugging. It explicitly separates the current Graphics Capture replacement path from legacy/optional C++ Capture and returns the MCP tool chain to use next. |
 
 ### Object index (Pipelines / Shaders / Resources — GUI 'Resources' pane parity)
 
@@ -116,6 +122,9 @@ UUID, frame counts, GPU info, primary API, and lists of
 | `ngfx_capture_decode_chunks` | Iterate the chunk stream — id, size, compression flag, payload offset. |
 | `ngfx_capture_decode_toc` | Decode the `PbTableOfContents` chunk: UUID, GPU, primary API, per-thread info, FunctionInfo + ResourceInfo chunk lists. |
 | `ngfx_capture_decompress_chunk_by_id` | Pull a single chunk and decompress its LZ4 payload to raw bytes. |
+| `ngfx_capture_search_payloads` | Search decompressed chunk payloads for shader names, hashes, or raw hex bytes when metadata-objects is too shallow. |
+| `ngfx_capture_shader_chunks` | Find embedded DXBC/DXIL shader chunks and compute hash candidates from a saved capture. |
+| `ngfx_capture_chunk_references` | Search decompressed chunks for references to a shader chunk id, hash, PDB path, or name. |
 | `ngfx_capture_decode_events` | Best-effort per-event decode (limited — see caveat below). |
 | `ngfx_capture_event_args` | Single-event arg lookup. Same shape as the C++-Capture-derived `ngfx_cpp_capture_event_args` once the FunctionInfo binary layout is fully RE'd. |
 
@@ -152,13 +161,23 @@ byte 8+  = body (length = body_size)
 **Dispatch model:** `(category u32, method u32)` keyed 2-D handler table.
 Method enums (already in the proto pool) include `BinaryReplayMethod`
 with 110 entries — `MethodApiInspectorStateRequest=33`,
-`MethodRootParametersRequest=67`, etc. Category id `1 = Diagnostics`.
+`MethodRootParametersRequest=67`, etc. System category ids are pinned from
+`ngfx-rpc.exe::SystemCategories.proto`; Pylon replay uses its own category
+namespace where `CategoryBinaryReplay=1`. The remaining live blocker is the
+private namespace/session/slot binding the UI performs before BinaryReplay
+requests are accepted.
 
 | Tool | What it does |
 | --- | --- |
 | `ngfx_rpc_protocol_info` | Return the decoded transport spec + the in-process method-enum tables (no live connection needed). |
 | `ngfx_rpc_transport_connect` | Open a TCP / named-pipe / domain-socket connection to a running `ngfx-rpc.exe` and return a session handle. |
 | `ngfx_rpc_send_raw_frame` | Send an arbitrary framed message and read the reply — escape hatch for experimenting with the protocol. |
+| `ngfx_frame_debugger_rpc_schema` | Describe the private BinaryReplay pixel/resource history methods, ids, request schemas, and handle shapes. |
+| `ngfx_pixel_history` | Call `MethodPixelHistoryRequest` (`70`) for an image handle + pixel coordinate, or preview the exact protobuf body. |
+| `ngfx_resource_access_history` | Call `MethodResourceAccessHistoryRequest` (`53`) for an API data handle, or preview the request body. |
+| `ngfx_resource_revision_at_event` | Derive the resource revision at an event from access history, optionally reusing a persistent RPC session and fetching resource info or image subresource data. |
+| `ngfx_rpc_open_capture_session` / `ngfx_rpc_capture_session_status` / `ngfx_rpc_close_capture_session` | Keep a private frame-debugger RPC connection open across MCP calls. |
+| `ngfx_rpc_call_binary_replay` | Call an arbitrary BinaryReplay method on a persistent frame-debugger RPC session. |
 
 **Caveat (live-round-trip work in progress).** ngfx-rpc's TCP server is
 one-shot: it exits the moment the first client session ends. That makes
@@ -223,10 +242,23 @@ Both are documented in `docs/RPC_PROTOCOL.md`.
 | `ngfx_gputrace_archive` | Full zip listing + auto-decoded manifest JSON. |
 | `ngfx_gputrace_read_member` | Read a member as UTF-8 (auto-decodes JSON / CSV). |
 | `ngfx_gputrace_extract` | Extract a member to disk. |
+| `ngfx_gputrace_shader_pipeline_search` | Search shader/pipeline-looking GPU Trace members for a shader name, hash, or entry point. |
 | `ngfx_list_perf_report` | Enumerate `ngfx-replay --perf-report-dir` artifacts with auto-decoded JSON/CSV inline. |
+| `ngfx_gputrace_export_summary` | Summarize Nsight GPU Trace auto-export folders, including `REPRO_INFO.xls` and metric tables. |
+| `ngfx_gputrace_export_search` | Search exported GPU Trace text/XLS files for shader names, hashes, or event text. |
 | `ngfx_gputrace_archs` | List GPU architectures accepted by `--architecture`. |
 
 ### Generate C++ Capture → build → run
+
+Nsight 2026's durable replacement path for D3D12/Vulkan persistence is
+Graphics Capture (`ngfx-capture` / `ngfx-replay`) plus Graphics Debugger live
+replay. C++ Capture is still useful when it emits a project because the MCP
+can index generated source for per-call arguments, but the saved-capture
+exporter is private UI/plugin code and some Nsight builds can refuse D3D11/D3D12
+C++ serialization with guidance to migrate to Graphics Capture. Use
+`ngfx_deep_capture_capability_report` first when deciding whether C++ export,
+live replay RPC, GPU Trace-on-replay, or raw `.ngfx-capture` decoding is the
+right next step.
 
 The CLI activity (`ngfx --activity 'Generate C++ Capture'`) requires the
 original application to launch — it can't run against a saved capture.
@@ -235,9 +267,32 @@ The MCP also exposes the UI-driven path for that case (see next section).
 | Tool | What it does |
 | --- | --- |
 | `ngfx_cpp_capture_launched` | Run the Generate-C++-Capture activity (CLI; relaunches the app). |
+| `ngfx_cpp_capture_dump` | One-stop C++ capture dump helper: live app via CLI, or saved `.ngfx-gfxcap` via UI-assisted export, then optional call/PSO indexing. |
+| `ngfx_cpp_capture_saved_bridge_re_analyze` | Run targeted IDA passes over Nsight's private saved-capture C++ export plugins. |
+| `ngfx_cpp_capture_saved_bridge_re_report` | Summarize the recovered private serialize protocol, Pylon activity bridge, and remaining headless gap. |
+| `ngfx_cpp_capture_saved_pylon_handoff_preview` | Emit the pinned Pylon platform-launcher map for saved-capture Generate C++ Capture: `ngfx-replay.exe`, quoted capture argv, extra replay args, environment string, and `JsonProject['launcher']` settings. |
+| `ngfx_cpp_capture_saved_direct_rpc_plan` | Emit the recovered FrameDebugger serialize request + file-transfer callback plan for the direct RPC route. |
+| `ngfx_cpp_capture_saved_file_transfer_apply` | Apply one decoded FrameDebugger open/append/close file-transfer notification to disk for the direct RPC executor. |
+| `ngfx_cpp_capture_saved_output_dir_setting` | Preview or write the candidate Qt/QSettings `Serialization Save Directory` value used by BattlePlugin. |
+| `ngfx_cpp_capture_saved_ui_automation_attempt` | Best-effort `pywinauto` UI fallback for the Generate C++ Capture dialog, with structured blockers if automation is unavailable. |
+| `ngfx_cpp_capture_saved_headless_attempt` | One entrypoint that tries the pinned Pylon bridge, direct RPC route, and UI fallback, then validates/indexes any project that appears. |
+| `ngfx_cpp_capture_saved_export_validate` | Validate an emitted C++ Capture project, compare against capture metadata when available, and build call/PSO indexes. |
+| `ngfx_cpp_capture_saved_artifact_bundle` | Bundle capture/export validation/project artifacts into a zip for autonomous handoff and review. |
 | `ngfx_cpp_capture_find_solution` | Locate the produced `.sln`. |
 | `ngfx_cpp_capture_build` | MSBuild the project (auto-discovers MSBuild via vswhere). |
 | `ngfx_cpp_capture_run` | Run the produced exe and capture its output. |
+
+The saved-capture → C++ path is still private NVIDIA plugin code. The RE
+tools above preserve the current evidence: `BattlePlugin` sends
+`PbSerializeRequestMessage` through the FrameDebugger service and handles file
+transfer notifications, while `PylonPlugin` exposes the UI activity bridge
+that maps activity id 3 to *Generate C++ Capture*. The Pylon argv/config
+handoff is pinned now: the bridge uses `ngfx-replay.exe`, passes the saved
+capture as the first quoted argument, appends flattened replay-option args,
+passes a semicolon-joined environment string, and persists the platform map
+under `JsonProject['launcher']`. The remaining fully-headless gap is invoking
+Pylon's private activity manager outside the UI process, or completing the
+direct FrameDebugger Core RPC namespace/session binding.
 
 ### Per-call argument extraction (C++ Capture → SQLite index)
 
@@ -295,7 +350,9 @@ source. Shader bytecode is emitted as flat `static const unsigned char`
 arrays — DXBC blobs have the Microsoft compiler's 128-bit MD5 hash baked
 in at bytes 4..20 of the container (the exact bytes Nsight / PIX /
 RenderDoc display as the shader identity). For SPIR-V we compute SHA-1
-of the blob so Vulkan shaders still get a stable identity.
+of the blob so Vulkan shaders still get a stable identity. We also compute
+ShaderToggler's hash for every blob: CRC32 over the full raw shader
+bytecode, reported as both 8 hex digits and unsigned decimal.
 
 PSO creation calls (`CreateGraphicsPipelineState` /
 `CreateComputePipelineState` / `vkCreateGraphicsPipelines` /
@@ -306,10 +363,52 @@ those byte-array symbols (D3D12) or `vkCreateShaderModule` handles
 | Tool | What it answers |
 | --- | --- |
 | `ngfx_pso_index` | Walk a C++-Capture project, parse every shader byte-array + every PSO creation call, write `shader_blobs` + `pso_shaders` tables to the existing C++-Capture index DB. |
-| `ngfx_pso_get` | Look up one PSO's full stage map: each stage → `{shader_symbol, format (dxbc/dxil/spirv), hash_hex, hash_source, declared_byte_count, head_hex}`. |
+| `ngfx_pso_get` | Look up one PSO's full stage map: each stage → `{shader_symbol, format (dxbc/dxil/spirv), hash_hex, hash_source, shader_toggler_crc32, declared_byte_count, head_hex}`. |
 | `ngfx_pso_list` | Enumerate every indexed PSO with a one-line stage summary (`VS:g_VS_xxx, PS:g_PS_yyy`). |
-| `ngfx_pso_find_by_shader` | Reverse lookup: given a shader symbol OR a DXBC/SPIR-V hash, which PSOs use it (and as which stage)? Useful when a shader-debugger or perf trace gives you a hash. |
-| `ngfx_shader_blobs_list` | Enumerate every indexed shader byte-array (filterable by format / hash). |
+| `ngfx_pso_find_by_shader` | Reverse lookup: given a shader symbol, DXBC/SPIR-V hash, or ShaderToggler CRC32, which PSOs use it (and as which stage)? |
+| `ngfx_shader_blobs_list` | Enumerate every indexed shader byte-array (filterable by format, DXBC/SPIR-V hash, or ShaderToggler CRC32). |
+| `ngfx_shader_blobs_find_crc32` | Find shader byte-arrays by ShaderToggler CRC32, accepting either hex (`1cf439e7`) or decimal. |
+| `ngfx_shader_blob_dump` | Write a matched generated-C++ shader byte-array back to disk as raw DXBC/DXIL/SPIR-V bytes. |
+
+### Shader visual-bug triage
+
+These tools compose C++-Capture event args, PSO identity, descriptor state,
+and IDA-derived Nsight RE facts into reports an LLM can use to localise a
+visual bug before patching shaders.
+
+| Tool | What it answers |
+| --- | --- |
+| `ngfx_shader_triage_plan` | Concrete capture/index/compare/probe plan for a visual bug handoff. |
+| `ngfx_eye_issue_dump_report` | Nsight-only dump report for the right-eye issue: capture TOC, sidecar status, dump-only blockers, and next actions. |
+| `ngfx_eye_issue_event_signatures` | Candidate left/right event pairs from saved `metadata-functions` when only the `.ngfx-capture` dump exists. |
+| `ngfx_eye_event_index` | Classify C++-Capture events as left/right/both/unknown using stereo regexes, viewport/scissor half hints, and inherited state. |
+| `ngfx_compare_eye_passes` | Left/right count deltas for draws, dispatches, copies, and ray-tracing work. |
+| `ngfx_find_missing_eye_dispatches` | Dispatch/ray-tracing asymmetries, useful for missing producer work before a bad draw. |
+| `ngfx_event_state` | One event plus surrounding calls, descriptor/root state, render targets, recent writes, and PSO details. |
+| `ngfx_trace_resource_lineage` | Every indexed call mentioning a resource/symbol, bucketed by create/bind/write/copy/dispatch/draw/barrier role. |
+| `ngfx_pso_bind_trace` | `SetPipelineState` / `vkCmdBindPipeline` binds and the following draw/dispatch work, even when creation hooks missed the PSO. |
+| `ngfx_pso_swap_harness_plan` | Generate a D3D12 draw-time PSO swap harness plan and optional C++ snippet files for right-eye-only shader patch trials. |
+| `ngfx_shader_probe_plan` | Probe variants for terms such as `t5`, `t8`, `t9`, `screenTile`, `SV_Position`, `View[148]`, and `volumeUV`. |
+| `ngfx_shader_bug_triage` | Single LLM-ready report from handoff, capture path, C++ index, suspect PSO/hash/CRC, and ROI. |
+
+### Autonomous shader-fix loop helpers
+
+| Tool | What it answers |
+| --- | --- |
+| `ngfx_sn2_repro_plan` / `ngfx_sn2_repro_run` | Build or run the Subnautica 2 launch-script repro with the expected capture/log artifacts. |
+| `ngfx_cpp_capture_from_saved_capture` | Saved-capture C++ export wrapper around the best available UI-assisted path. |
+| `ngfx_pair_eye_events` | Pair classified left-eye and right-eye events and report missing counterparts. |
+| `ngfx_resolve_shader_slots` | Resolve shader slots such as `t5`/`t8`/`t9` to root-param evidence when a slot map or descriptor state is available. |
+| `ngfx_descriptor_resource_candidates` | Score likely resource handles for shader slots from a private descriptor-state RPC reply. |
+| `ngfx_trace_roi_history` | Generate or execute a grid of private pixel-history requests over a bad ROI. |
+| `ngfx_resource_producer_graph` | Build a best-effort read/write producer graph for named resources. |
+| `ngfx_import_uevr_trace` | Import NDJSON/JSON/CSV UEVR runtime hook traces into a summary or SQLite DB. |
+| `ngfx_pso_rehydration_plan` | Generate a C++ plan/snippet for cloning a graphics PSO with patched shader bytecode. |
+| `ngfx_shader_probe_execution_plan` | Emit the closed-loop run steps for a specific shader probe. |
+| `ngfx_diff_hdr_roi` | Diff PFM/raw-float HDR ROI data without clamping to 8-bit. |
+| `ngfx_autofix_loop_plan` | Return the autonomous patch/test/scoring loop. |
+| `ngfx_validate_fix_claim` | Evidence gate for accepting/rejecting an automated visual-fix claim. |
+| `ngfx_shader_fix_regression_score` | Score before/after fix metrics with repeatability, left-eye drift, event-sequence, and PSO coverage gates. |
 
 ### Object handle / UID resolver
 
@@ -353,6 +452,22 @@ index, and (when present) the C++-Capture index.
 | `ngfx_sdk_header_text` | Return the raw text of any SDK header (e.g. `NGFX_GPUTrace_D3D12.h`). |
 | `ngfx_sdk_snippet` | Codegen a ready-to-paste C++ snippet for `(activity, api)` — e.g. `(GPUTrace, Vulkan)` → an init + start/stop pair. |
 
+### IDA Pro headless RE bridge
+
+The shipped headers cover in-app capture/trace control, but saved-capture
+frame-debugger state, pixel history, resource history, and several replay/RPC
+paths live behind Nsight's internal binaries. The MCP can drive IDA Pro
+headless to cache compact JSON facts for those gaps.
+
+| Tool | What it does |
+| --- | --- |
+| `ngfx_ida_environment` | Discover IDA Pro/Home/Free installs and list known Nsight RE targets. Override with `NSIGHT_GRAPHICS_MCP_IDA`. |
+| `ngfx_ida_analyze_binary` | Run IDA headless over a target such as `ngfx_rpc`, `ngfx_replay`, `frame_debugger_native`, `frame_debugger_d3d12`, or `frame_debugger_vulkan`; exports strings, xrefs, selected functions, and bounded Hex-Rays pseudocode into the MCP cache. |
+| `ngfx_ida_search_facts` | Regex-search cached IDA facts without re-running IDA. |
+| `ngfx_ida_fact_summary` | Summarize a facts JSON. |
+| `ngfx_ida_command_preview` | Show the exact headless command shape without running it. |
+| `ngfx_shader_debug_re_status` | Check whether the RE facts needed for shader-debug automation are cached and show the implementation sequence for pixel history, resource history, event state, and shader variant testing. |
+
 ### Project files + UI hand-off
 
 | Tool | What it does |
@@ -381,7 +496,7 @@ index, and (when present) the C++-Capture index.
 
 ## How big is the surface?
 
-**119 MCP tools** as of this writing, grouped by the sections below.
+**221 MCP tools** as of this writing, grouped by the sections below.
 Run `nsight-graphics-mcp --list-tools` (or import the package and inspect
 `server`) for an up-to-date enumeration.
 
@@ -636,6 +751,10 @@ ngfx_pso_get(
 # Reverse: given a hash from a perf tool / shader debugger,
 ngfx_pso_find_by_shader(db_path="...", hash_hex="aabbccdd...")
 # → [{pso_symbol, stage, shader_symbol, api}, ...]
+
+# ShaderToggler hash path: hex notes and decimal ShaderToggler.ini values both work.
+ngfx_shader_blobs_find_crc32(db_path="...", crc32_hex="1cf439e7")
+ngfx_shader_blob_dump(db_path="...", crc32_hex="1cf439e7", output_path="C:/tmp/1cf439e7.dxil")
 ```
 
 ### 15. Browse the protobuf schema (RE-derived)
@@ -733,7 +852,9 @@ tests/                   # pytest suite — synthetic data for the parsers,
                          # real-binary tests for proto_descriptors when
                          # Nsight Graphics is installed locally.
 docs/
-  CAPTURE_FORMAT.md      # RE notes on the .ngfx-gfxcap wrapper
+  CAPTURE_FORMAT.md                 # RE notes on the .ngfx-gfxcap wrapper
+  RPC_PROTOCOL.md                   # RE notes on ngfx-rpc.exe transport
+  NSIGHT_SHADER_DEBUG_AUTONOMY.md   # current shader-debugging status/plan
 ```
 
 ## License
@@ -742,7 +863,7 @@ MIT.
 
 ## Full tool reference
 
-Auto-generated from `server.py` docstrings. **119 tools** organised by
+Auto-generated from `server.py` docstrings. **221 tools** organised by
 the section comments in `server.py` — the order matches what you'd
 discover scrolling the file.
 
@@ -750,6 +871,7 @@ discover scrolling the file.
 
 - **`ngfx_environment`** — Report the resolved Nsight Graphics install + per-tool paths + cache dirs.
 - **`ngfx_list_installs`** — List every Nsight Graphics install detected on this machine.
+- **`ngfx_deep_capture_capability_report`** — Rank Graphics Capture, live replay RPC, GPU Trace-on-replay, C++ Capture, and raw capture decoding for deep shader/render debugging from a saved dump.
 - **`ngfx_version`** — Return the version reported by ``ngfx.exe --version``.
 - **`ngfx_list_activities`** — List the activity names that ``ngfx.exe`` accepts (parsed from --help).
 
@@ -761,7 +883,7 @@ discover scrolling the file.
 ### Headless Graphics Capture via ngfx-capture.exe
 
 - **`ngfx_capture_launched`** — Run ``ngfx-capture.exe`` directly (no Nsight UI required).
-- **`ngfx_capture_recapture`** — Recapture / recompress an existing ``.ngfx-gfxcap`` with the current format.
+- **`ngfx_capture_recapture`** — Recapture / recompress an existing ``.ngfx-capture`` / ``.ngfx-gfxcap`` with the current format.
 - **`ngfx_capture_recompress`** — Recompress an existing capture without re-running the application.
 
 ### Capture session management + metadata
@@ -786,6 +908,7 @@ discover scrolling the file.
 - **`ngfx_gputrace_archs`** — Return the list of GPU architectures accepted by ``--architecture``.
 - **`ngfx_gputrace_launched`** — Run ``ngfx --activity 'GPU Trace Profiler' --exe <exe> ...``.
 - **`ngfx_gputrace_attached`** — Attach GPU Trace to a running process by PID. Defaults to hotkey-driven.
+- **`ngfx_gputrace_capture_replay`** — Run GPU Trace Profiler against `ngfx-replay.exe` for a saved Graphics Capture, using replay-begin/replay-end triggers.
 
 ### GPU Trace report session management
 
@@ -793,10 +916,21 @@ discover scrolling the file.
 - **`ngfx_list_gputraces`** — _(no docstring)_
 - **`ngfx_close_gputrace`** — _(no docstring)_
 - **`ngfx_gputrace_inspect`** — Best-effort inspection of a ``.nsight-gputrace`` file.
+- **`ngfx_gputrace_shader_pipeline_search`** — Search shader/pipeline GPU Trace data for a shader hash, name, or entry point.
 
 ### Generate C++ Capture activity
 
 - **`ngfx_cpp_capture_launched`** — Run ``ngfx --activity 'Generate C++ Capture' ...``.
+- **`ngfx_cpp_capture_saved_bridge_re_analyze`** — Run the targeted IDA passes for the private saved-capture -> C++ bridge.
+- **`ngfx_cpp_capture_saved_bridge_re_report`** — Summarize current RE evidence for fully headless saved C++ export.
+- **`ngfx_cpp_capture_saved_pylon_handoff_preview`** — Preview the pinned Pylon launcher settings for saved-capture Generate C++ Capture.
+- **`ngfx_cpp_capture_saved_direct_rpc_plan`** — Preview the direct FrameDebugger serialize-RPC request/callback plan.
+- **`ngfx_cpp_capture_saved_file_transfer_apply`** — Apply one FrameDebugger serialize file-transfer notification to disk.
+- **`ngfx_cpp_capture_saved_output_dir_setting`** — Preview or write the candidate QSettings output-dir value for C++ export.
+- **`ngfx_cpp_capture_saved_export_validate`** — Validate and index a saved-capture Generate-C++-Capture export.
+- **`ngfx_cpp_capture_saved_ui_automation_attempt`** — Best-effort pywinauto UI fallback for saved-capture C++ export.
+- **`ngfx_cpp_capture_saved_headless_attempt`** — Try all known saved-capture -> C++ export routes, then validate output.
+- **`ngfx_cpp_capture_saved_artifact_bundle`** — Bundle capture/export validation artifacts into one zip.
 
 ### OpenGL Frame Debugger
 
@@ -815,6 +949,14 @@ discover scrolling the file.
 - **`ngfx_rpc_protocol_info`** — Return everything we know about the ``ngfx-rpc.exe`` custom wire protocol — handy as a self-describing reference for callers writing their own clients. The full derivation lives in ``docs/RPC_PROTOCOL.md`` (in this repo).
 - **`ngfx_rpc_transport_connect`** — Open one TCP transport connection to a running ``ngfx-rpc.exe`` and immediately close it. Useful as a smoke test: it verifies the server is reachable and that the 8-byte frame magic checks out.
 - **`ngfx_rpc_send_raw_frame`** — Low-level escape hatch: send one transport frame and (optionally) await one reply frame. Useful for protocol RE work.
+- **`ngfx_frame_debugger_rpc_schema`** — Describe the private BinaryReplay RPC methods used for pixel/resource history.
+- **`ngfx_pixel_history`** — Call Nsight's private BinaryReplay pixel-history method or preview the exact protobuf request.
+- **`ngfx_resource_access_history`** — Call Nsight's private resource-access-history method for one API handle.
+- **`ngfx_resource_revision_at_event`** — Derive a resource revision at an event from private resource history, with optional persistent-session reuse.
+- **`ngfx_rpc_open_capture_session`** — Open a persistent frame-debugger RPC session and optionally launch a capture.
+- **`ngfx_rpc_capture_session_status`** — List persistent frame-debugger RPC sessions, or summarize one handle.
+- **`ngfx_rpc_close_capture_session`** — Close a persistent frame-debugger RPC session.
+- **`ngfx_rpc_call_binary_replay`** — Call an arbitrary BinaryReplay method on an open frame-debugger RPC session.
 
 ### Aftermath (crash-dump tools)
 
@@ -869,7 +1011,10 @@ discover scrolling the file.
 - **`ngfx_gputrace_archive`** — Open a .nsight-gputrace as a zip archive and list its members + decode any small JSON manifests inline.
 - **`ngfx_gputrace_read_member`** — Read a member of the .nsight-gputrace archive as UTF-8 text (no disk extraction). Auto-decodes JSON / CSV payloads.
 - **`ngfx_gputrace_extract`** — Extract a specific member of the .nsight-gputrace archive to ``out_dir``.
+- **`ngfx_gputrace_shader_pipeline_search`** — Search shader/pipeline-looking archive members for CopyRectPS-style shader evidence.
 - **`ngfx_list_perf_report`** — List the artifacts written by ``ngfx-replay --perf-report-dir``.
+- **`ngfx_gputrace_export_summary`** — Summarize Nsight GPU Trace auto-export folders.
+- **`ngfx_gputrace_export_search`** — Search exported GPU Trace text/XLS files for shader names, hashes, or event text.
 
 ### Nsight project file authoring
 
@@ -882,6 +1027,7 @@ discover scrolling the file.
 - **`ngfx_cpp_capture_find_solution`** — Locate the .sln produced by a Generate-C++-Capture run.
 - **`ngfx_cpp_capture_build`** — Invoke MSBuild on a Generate-C++-Capture output directory or .sln.
 - **`ngfx_cpp_capture_run`** — Run a Generate-C++-Capture exe to verify the repro still works.
+- **`ngfx_cpp_capture_dump`** — One-stop helper for producing a C++ Capture dump and indexing it. Uses the headless CLI for live app launches and the UI-assisted path for saved captures.
 - **`ngfx_cpp_capture_open_in_ui`** — Open a saved capture in ``ngfx-ui.exe`` so the human can run the UI's *Generate C++ Capture* activity against it (the CLI activity can't, it requires the original application to re-launch).
 - **`ngfx_cpp_capture_wait_for_project`** — Poll ``watch_dir`` until a Generate-C++-Capture project lands and its .sln stops growing. Returns the project root + the solution path.
 - **`ngfx_cpp_capture_index_calls`** — Walk a Generate-C++-Capture project, parse every command-list / command-buffer call, and index them into SQLite for per-event queries.
@@ -943,10 +1089,42 @@ discover scrolling the file.
 ### PSO → DXBC / SPIR-V hash mapping
 
 - **`ngfx_pso_index`** — Walk a Generate-C++-Capture project and index PSO → shader-hash mappings into SQLite.
-- **`ngfx_pso_get`** — Look up one PSO's shader stages: each entry is ``{shader_symbol, format (dxbc/dxil/spirv), hash_hex, hash_source, declared_byte_count, head_hex}``.
+- **`ngfx_pso_get`** — Look up one PSO's shader stages: each entry is ``{shader_symbol, format (dxbc/dxil/spirv), hash_hex, hash_source, shader_toggler_crc32, declared_byte_count, head_hex}``.
 - **`ngfx_pso_list`** — List every indexed PSO with a one-line stage summary (``VS:g_VS_xxx, PS:g_PS_yyy``). Filter by ``api`` (``d3d12``/ ``vulkan``).
-- **`ngfx_pso_find_by_shader`** — Reverse lookup: which PSOs use a given shader? Supply EITHER the C-level shader symbol (e.g. ``g_VS_0x1234``) OR a DXBC/SPIR-V hash. Useful when a shader-debugger or perf trace gives you a hash and you want to know every PSO it's bound to.
-- **`ngfx_shader_blobs_list`** — List indexed shader bytecode blobs from a C++-Capture project. Filter by ``format`` (``dxbc``/``dxil``/``spirv``/``unknown``) and/or ``hash_hex`` (exact match).
+- **`ngfx_pso_find_by_shader`** — Reverse lookup: which PSOs use a given shader? Supply the C-level shader symbol (e.g. ``g_VS_0x1234``), a DXBC/SPIR-V hash, or a ShaderToggler CRC32.
+- **`ngfx_shader_blobs_list`** — List indexed shader bytecode blobs from a C++-Capture project. Filter by ``format`` (``dxbc``/``dxil``/``spirv``/``unknown``), ``hash_hex`` (exact match), and/or ``shader_toggler_crc32``.
+- **`ngfx_shader_blobs_find_crc32`** — Find shader bytecode blobs by ShaderToggler CRC32, accepting either hex or decimal.
+- **`ngfx_shader_blob_dump`** — Dump one indexed shader bytecode blob to disk by shader symbol or ShaderToggler CRC32.
+
+### Shader visual-bug triage orchestration
+
+- **`ngfx_shader_triage_plan`** — Return the concrete MCP workflow for localising and fixing a shader visual bug.
+- **`ngfx_eye_issue_dump_report`** — Summarize saved-capture evidence, dump-only blockers, and the next Nsight-only actions for the right-eye issue.
+- **`ngfx_eye_issue_event_signatures`** — Build candidate left/right event pairs from name-only saved function metadata.
+- **`ngfx_eye_event_index`** — Classify C++-Capture events as left/right/both/unknown using stereo regexes, viewport/scissor half hints, and inherited state.
+- **`ngfx_compare_eye_passes`** — Compare left/right draw/dispatch/copy counts from a C++-Capture index.
+- **`ngfx_find_missing_eye_dispatches`** — Find dispatch/ray-tracing asymmetries between classified eyes.
+- **`ngfx_event_state`** — Return a draw/dispatch event, nearby calls, bound descriptors, and PSO info.
+- **`ngfx_trace_resource_lineage`** — Find C++-Capture calls that mention a resource/symbol and bucket by role.
+- **`ngfx_pso_bind_trace`** — Trace SetPipelineState/vkCmdBindPipeline and following draw/dispatch work.
+- **`ngfx_pso_swap_harness_plan`** — Generate a D3D12 draw-time PSO swap harness plan and optional C++ files.
+- **`ngfx_shader_probe_plan`** — Generate a targeted shader-probe plan for suspect terms such as t5/t8/t9.
+- **`ngfx_shader_bug_triage`** — Produce one LLM-ready shader-bug report from capture/index/handoff evidence.
+- **`ngfx_sn2_repro_plan`** — Build the exact Subnautica 2 launch-script repro command and expected artifacts.
+- **`ngfx_sn2_repro_run`** — Dry-run or execute the Subnautica 2 repro launch script with capture-friendly environment.
+- **`ngfx_cpp_capture_from_saved_capture`** — Export Generate-C++-Capture output from a saved capture via the available Nsight path.
+- **`ngfx_pair_eye_events`** — Pair left/right draw, dispatch, copy, and ray-tracing events and report missing counterparts.
+- **`ngfx_resolve_shader_slots`** — Resolve shader resource slots such as `t5`, `t8`, and `t9` to root/descriptor evidence where available.
+- **`ngfx_descriptor_resource_candidates`** — Score likely resource handles for shader slots from a private descriptor-state RPC reply.
+- **`ngfx_trace_roi_history`** — Generate or execute private pixel-history requests for a grid over a suspect ROI.
+- **`ngfx_resource_producer_graph`** — Build a best-effort graph of resource producers/readers from a C++-Capture index.
+- **`ngfx_import_uevr_trace`** — Import UEVR hook traces from JSON, NDJSON, CSV, or key/value logs into summaries or SQLite.
+- **`ngfx_pso_rehydration_plan`** — Generate a C++ clone/recreate plan for testing patched shader bytecode in a graphics PSO.
+- **`ngfx_shader_probe_execution_plan`** — Emit the closed-loop steps for a concrete shader probe trial.
+- **`ngfx_diff_hdr_roi`** — Compare raw/PFM float image ROI data without 8-bit clamping.
+- **`ngfx_autofix_loop_plan`** — Return the autonomous patch/test/score loop used to drive repeated fix trials.
+- **`ngfx_validate_fix_claim`** — Reject or accept fix claims using improvement, repeatability, left-eye drift, and causality gates.
+- **`ngfx_shader_fix_regression_score`** — Score whether a shader-fix run is acceptable or regressed.
 
 ### Frame cost analysis — top-N expensive draws/dispatches/regions
 
@@ -964,6 +1142,9 @@ discover scrolling the file.
 - **`ngfx_capture_decode_chunks`** — List the first ``max_chunks`` chunks of a capture file.
 - **`ngfx_capture_decode_toc`** — Decode the ``NV.PbTableOfContents`` chunk of a capture file.
 - **`ngfx_capture_decompress_chunk_by_id`** — Locate the chunk whose ``kind`` (chunk-id) equals ``chunk_id`` and decompress it.
+- **`ngfx_capture_search_payloads`** — Search decompressed capture chunks for shader names, hashes, or raw hex bytes.
+- **`ngfx_capture_shader_chunks`** — Find embedded DXBC/DXIL shader blobs in a saved capture and return chunk IDs, strings, and hash candidates.
+- **`ngfx_capture_chunk_references`** — Search decompressed capture chunks for references to a chunk id or arbitrary byte/string needles.
 - **`ngfx_capture_decode_events`** — Best-effort scan for serialised ``PbFunctionCallDesc`` records.
 - **`ngfx_capture_event_args`** — Look up the per-event arguments at ``event_index`` via direct capture decoding.
 

@@ -119,27 +119,26 @@ Method ids come straight from the embedded `*.proto` `*Method` enums:
 | `WarpVizHostMethod`      | `WarpViz.proto`        | 8 methods |
 | `WarpVizChunkMethod`     | `WarpViz.proto`        | 2 methods |
 
-### Global category numbering — partially pinned
+### Category numbering — pinned by embedded proto enums
 
-The 2-D dispatch table is keyed by a **global category id**, not by the
-proto package. We pinned the value for `Diagnostics`:
+System-service categories are pinned by `SystemCategories.proto` embedded
+in `ngfx-rpc.exe`:
 
-In `ping_recv__sub_1407D28B0.c` the `DataBufferMessage` is constructed
-with two adjacent dwords baked into the binary:
+| id | category |
+| --- | --- |
+| 1 | Diagnostics |
+| 2 | SystemInfo |
+| 3 | Discovery |
+| 4 | Handshake |
+| 5 | DeviceInfo |
+| 6 | Connection |
+| 7 | LocalDiscovery |
 
-```c
-v10[14] = dword_14128FE40;   // = 0x00000001  -> category = 1
-v10[15] = dword_14128FE44;   // = 0x00000006  -> method   = 6
-```
-
-`DiagnosticsMethod::DataBuffer == 6` confirms category-id 1 is
-`Diagnostics`. The other category ids are unknown without further
-pinning; the binary registers the SystemService handlers
-(`AttachMessage`, `DetachMessage`, `PingRequestMessage`,
-`DataBuffersRequestMessage`, `GetProcessInfoRequestMessage`,
-`GetSystemInfoRequestMessage`, `GetDeviceInfoRequestMessage`,
-`PbTargetHandshakeBeginMessage`, `TerminateMessage`) in a known order
-that *suggests* the global numbering follows the order they're registered.
+Pylon replay has a separate namespace in `PylonUi.proto` where
+`CategoryBinaryReplay == 1`. That removes the stale "BinaryReplay=7"
+guess. The remaining live question is how `ngfx-ui` binds that Pylon
+namespace/session/slot on the transport before BinaryReplay requests are
+accepted.
 
 ## Per-message in-memory `MessageHeader` layout — confirmed
 
@@ -159,16 +158,18 @@ by `hdr_init__sub_140985480.c`):
 | +48    | u64       | **ticket_id**| likely; the `"Transaction with ticketId = %llu"` log uses a u64 |
 | +56    | u32       | sertype      | `hdr_get_sertype__sub_140985540.c` returns `*(u32*)(a1+56)` |
 
-## Per-message wire format — UNRESOLVED
+## Per-message wire format — historical dead ends
 
-This is the **single remaining blocker**. We know the body of one
+This was the **single remaining blocker** before the 2026-05-19 IDA pass
+decoded the compact 24-byte header described below. At that point we knew
+the body of one
 transport frame contains:
 
 1. A serialized form of the C++ `MessageHeader` (carrying category /
    method / ticket_id / sertype).
 2. The serialized protobuf body for the chosen `(category, method)` pair.
 
-We do **not** know the exact on-wire encoding of (1). The three plausible
+We did **not** know the exact on-wire encoding of (1). The three plausible
 candidates, in decreasing order of likelihood:
 
 * **A.** Raw memcpy of the 60-byte C++ struct (little-endian native order
@@ -179,7 +180,7 @@ candidates, in decreasing order of likelihood:
   corresponding `.proto` for it in the embedded schema, so this is
   unlikely).
 
-### Why we couldn't disambiguate
+### Why this took a separate pass
 
 1. **The server crashes on any malformed input.** Sending a transport
    frame whose body the server cannot deserialise causes the server
@@ -223,14 +224,12 @@ The Python client in
 * `class RpcTransport` — fully functional 8-byte framing, send/recv,
   validates magic bytes. **Tested live against `ngfx-rpc.exe`** — sends
   and receives bytes cleanly.
-* `class RpcMessage` / `class RpcMessageHeader` — **conjectural** raw-struct
-  layout (option A above). When this turns out to be wrong, edit
-  `RpcMessageHeader.WIRE_LAYOUT` and add a new encoder. The class is
-  designed for easy swapping.
+* `class RpcMessage` / `class RpcMessageHeader` — decoded 24-byte header
+  encoder/decoder.
 * `class RpcClient` — high-level method wrappers
   (`handshake`, `event_details`, `api_inspector_state`,
-  `root_parameters`, `descriptor_state`). These will start working as
-  soon as `RpcMessageHeader.pack()` produces the correct wire bytes.
+  `root_parameters`, `descriptor_state`). The next gap is Pylon
+  namespace/session/slot setup, not header bytes.
 
 ## ✅ MessageHeader wire format — DECODED
 

@@ -36,6 +36,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
@@ -112,6 +113,7 @@ class ShaderBlob:
     format: str            # "dxbc" | "dxil" | "spirv" | "unknown"
     hash_hex: str | None   # DXBC: built-in MD5; SPIR-V: SHA-1; unknown: None
     hash_source: str       # "dxbc-builtin" | "sha1-of-blob" | None
+    shader_toggler_crc32: str
     head_hex: str          # first 24 bytes for visibility
 
 
@@ -130,6 +132,16 @@ def _identify_blob(leading: bytes, full_size: int, body: str | None) -> tuple[st
     return "unknown", None, ""
 
 
+def shader_toggler_crc32(blob: bytes) -> str:
+    """Return the ShaderToggler identity hash for a shader bytecode blob.
+
+    ShaderToggler computes ``compute_crc32(shader_desc.code, code_size)``
+    in its ReShade ``init_pipeline`` callback. That implementation is the
+    standard reflected CRC32 used by zlib.
+    """
+    return f"{zlib.crc32(blob) & 0xFFFFFFFF:08x}"
+
+
 def parse_shader_arrays(text: str, path: Path) -> list[ShaderBlob]:
     out: list[ShaderBlob] = []
     for m in _RE_SHADER_ARRAY.finditer(text):
@@ -138,6 +150,7 @@ def parse_shader_arrays(text: str, path: Path) -> list[ShaderBlob]:
         leading = _parse_leading_bytes(body, max_bytes=24)
         if not leading:
             continue
+        full = _full_blob_bytes(body)
         declared = _full_byte_count(body)
         fmt, h, src = _identify_blob(leading, declared, body if leading[:4] in (SPIRV_MAGIC_LE, SPIRV_MAGIC_BE) else None)
         line_no = text.count("\n", 0, m.start()) + 1
@@ -149,6 +162,7 @@ def parse_shader_arrays(text: str, path: Path) -> list[ShaderBlob]:
             format=fmt,
             hash_hex=h,
             hash_source=src,
+            shader_toggler_crc32=shader_toggler_crc32(full),
             head_hex=leading.hex(),
         ))
     return out
@@ -276,6 +290,7 @@ CREATE TABLE IF NOT EXISTS shader_blobs(
     format               TEXT NOT NULL,
     hash_hex             TEXT,
     hash_source          TEXT,
+    shader_toggler_crc32 TEXT,
     head_hex             TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS i_shader_blobs_hash ON shader_blobs(hash_hex);
@@ -295,6 +310,25 @@ CREATE INDEX IF NOT EXISTS i_pso_shaders_pso ON pso_shaders(pso_symbol);
 CREATE INDEX IF NOT EXISTS i_pso_shaders_shader ON pso_shaders(shader_symbol);
 CREATE INDEX IF NOT EXISTS i_pso_shaders_api ON pso_shaders(api);
 """
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, name: str, definition: str) -> None:
+    columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if name not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+
+
+def _ensure_shader_blobs_crc32_column(conn: sqlite3.Connection) -> None:
+    has_shader_blobs = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'shader_blobs'"
+    ).fetchone()
+    if not has_shader_blobs:
+        return
+    _ensure_column(conn, "shader_blobs", "shader_toggler_crc32", "TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS i_shader_blobs_shader_toggler_crc32 "
+        "ON shader_blobs(shader_toggler_crc32)"
+    )
 
 
 def _find_enclosing_function(text: str, pso_match_end: int) -> tuple[int, int]:
@@ -461,6 +495,7 @@ def index_project_psos(project_dir: Path, *, db_path: Path | None = None,
     conn = sqlite3.connect(db_path)
     try:
         conn.executescript(PSO_SCHEMA)
+        _ensure_shader_blobs_crc32_column(conn)
         if force:
             conn.execute("DELETE FROM shader_blobs")
             conn.execute("DELETE FROM pso_shaders")
@@ -473,11 +508,11 @@ def index_project_psos(project_dir: Path, *, db_path: Path | None = None,
             seen_syms.add(b.symbol)
             rows.append((b.symbol, b.file_path, b.line_number,
                          b.declared_byte_count, b.format, b.hash_hex,
-                         b.hash_source, b.head_hex))
+                         b.hash_source, b.shader_toggler_crc32, b.head_hex))
         conn.executemany(
             "INSERT OR REPLACE INTO shader_blobs(symbol, file_path, line_number, "
-            "declared_byte_count, format, hash_hex, hash_source, head_hex) "
-            "VALUES (?,?,?,?,?,?,?,?)",
+            "declared_byte_count, format, hash_hex, hash_source, shader_toggler_crc32, head_hex) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
             rows,
         )
         # Insert PSO→shader rows
@@ -522,13 +557,38 @@ def _connect(db_path: Path) -> sqlite3.Connection:
     return sqlite3.connect(db_path)
 
 
+def _crc32_decimal(crc32_hex: str | None) -> int | None:
+    return int(crc32_hex, 16) if crc32_hex else None
+
+
+def _normalise_shader_toggler_crc32(
+    *,
+    crc32_hex: str | None = None,
+    crc32_decimal: int | str | None = None,
+) -> str:
+    if (crc32_hex is None) == (crc32_decimal is None):
+        raise ValueError("supply exactly one of crc32_hex or crc32_decimal")
+    if crc32_hex is not None:
+        s = str(crc32_hex).strip().lower()
+        if s.startswith("0x"):
+            s = s[2:]
+        value = int(s, 16)
+    else:
+        value = int(str(crc32_decimal).strip(), 10)
+    if not 0 <= value <= 0xFFFFFFFF:
+        raise ValueError("CRC32 value is outside uint32 range")
+    return f"{value:08x}"
+
+
 def get_pso(db_path: Path, pso_symbol: str) -> dict[str, Any] | None:
     conn = _connect(db_path)
     try:
+        _ensure_shader_blobs_crc32_column(conn)
         rows = conn.execute(
             "SELECT pso.stage, pso.shader_symbol, pso.api, pso.creator, "
             "pso.file_path, pso.line_number, "
-            "blob.format, blob.hash_hex, blob.hash_source, blob.declared_byte_count, blob.head_hex "
+            "blob.format, blob.hash_hex, blob.hash_source, blob.declared_byte_count, "
+            "blob.shader_toggler_crc32, blob.head_hex "
             "FROM pso_shaders pso "
             "LEFT JOIN shader_blobs blob ON blob.symbol = pso.shader_symbol "
             "WHERE pso.pso_symbol = ? ORDER BY pso.stage",
@@ -549,7 +609,9 @@ def get_pso(db_path: Path, pso_symbol: str) -> dict[str, Any] | None:
                     "hash_hex": r[7],
                     "hash_source": r[8],
                     "declared_byte_count": r[9],
-                    "head_hex": r[10],
+                    "shader_toggler_crc32": r[10],
+                    "shader_toggler_crc32_decimal": _crc32_decimal(r[10]),
+                    "head_hex": r[11],
                 }
                 for r in rows
             },
@@ -591,17 +653,28 @@ def list_psos(db_path: Path, *, api: str | None = None, limit: int = 500,
 
 
 def find_psos_using_shader(db_path: Path, *, shader_symbol: str | None = None,
-                           hash_hex: str | None = None) -> list[dict[str, Any]]:
+                           hash_hex: str | None = None,
+                           shader_toggler_crc32: str | None = None) -> list[dict[str, Any]]:
     """Reverse lookup: which PSOs reference a given shader symbol or hash?"""
-    if not shader_symbol and not hash_hex:
-        raise ValueError("must supply shader_symbol or hash_hex")
+    supplied = sum(x is not None for x in (shader_symbol, hash_hex, shader_toggler_crc32))
+    if supplied != 1:
+        raise ValueError("supply exactly one of shader_symbol, hash_hex, or shader_toggler_crc32")
     conn = _connect(db_path)
     try:
+        _ensure_shader_blobs_crc32_column(conn)
         if shader_symbol:
             target_syms = [shader_symbol]
-        else:
+        elif hash_hex:
             target_syms = [r[0] for r in conn.execute(
-                "SELECT symbol FROM shader_blobs WHERE hash_hex = ?", (hash_hex,)
+                "SELECT symbol FROM shader_blobs WHERE hash_hex = ?", (hash_hex.lower(),)
+            ).fetchall()]
+            if not target_syms:
+                return []
+        else:
+            target_crc32 = _normalise_shader_toggler_crc32(crc32_hex=shader_toggler_crc32)
+            target_syms = [r[0] for r in conn.execute(
+                "SELECT symbol FROM shader_blobs WHERE shader_toggler_crc32 = ?",
+                (target_crc32,),
             ).fetchall()]
             if not target_syms:
                 return []
@@ -620,30 +693,377 @@ def find_psos_using_shader(db_path: Path, *, shader_symbol: str | None = None,
 
 
 def list_shader_blobs(db_path: Path, *, format: str | None = None,
-                      hash_hex: str | None = None, limit: int = 500) -> list[dict[str, Any]]:
+                      hash_hex: str | None = None,
+                      shader_toggler_crc32: str | None = None,
+                      limit: int = 500) -> list[dict[str, Any]]:
     conn = _connect(db_path)
     try:
+        _ensure_shader_blobs_crc32_column(conn)
         clauses, params = [], []
         if format:
             clauses.append("format = ?")
             params.append(format)
         if hash_hex:
             clauses.append("hash_hex = ?")
-            params.append(hash_hex)
+            params.append(hash_hex.lower())
+        if shader_toggler_crc32:
+            clauses.append("shader_toggler_crc32 = ?")
+            params.append(_normalise_shader_toggler_crc32(crc32_hex=shader_toggler_crc32))
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         params.append(limit)
         rows = conn.execute(
-            f"SELECT symbol, format, hash_hex, hash_source, declared_byte_count, "
+            f"SELECT symbol, format, hash_hex, hash_source, shader_toggler_crc32, declared_byte_count, "
             f"file_path, line_number, head_hex FROM shader_blobs {where} "
             f"ORDER BY symbol LIMIT ?", params,
         ).fetchall()
         return [
             {
                 "symbol": r[0], "format": r[1], "hash_hex": r[2],
-                "hash_source": r[3], "declared_byte_count": r[4],
-                "file_path": r[5], "line_number": r[6], "head_hex": r[7],
+                "hash_source": r[3],
+                "shader_toggler_crc32": r[4],
+                "shader_toggler_crc32_decimal": _crc32_decimal(r[4]),
+                "declared_byte_count": r[5],
+                "file_path": r[6], "line_number": r[7], "head_hex": r[8],
             }
             for r in rows
         ]
     finally:
         conn.close()
+
+
+def find_shader_blobs_by_shader_toggler_crc32(
+    db_path: Path,
+    *,
+    crc32_hex: str | None = None,
+    crc32_decimal: int | str | None = None,
+    limit: int = 500,
+) -> list[dict[str, Any]]:
+    target = _normalise_shader_toggler_crc32(
+        crc32_hex=crc32_hex,
+        crc32_decimal=crc32_decimal,
+    )
+    blobs = list_shader_blobs(db_path, shader_toggler_crc32=target, limit=limit)
+    conn = _connect(db_path)
+    try:
+        for blob in blobs:
+            refs = conn.execute(
+                "SELECT pso_symbol, stage, api, creator, file_path, line_number "
+                "FROM pso_shaders WHERE shader_symbol = ? ORDER BY pso_symbol, stage",
+                (blob["symbol"],),
+            ).fetchall()
+            blob["pso_references"] = [
+                {
+                    "pso_symbol": r[0],
+                    "stage": r[1],
+                    "api": r[2],
+                    "creator": r[3],
+                    "file_path": r[4],
+                    "line_number": r[5],
+                }
+                for r in refs
+            ]
+    finally:
+        conn.close()
+    return blobs
+
+
+def _shader_blob_bytes_from_source(file_path: Path, shader_symbol: str) -> bytes:
+    text = file_path.read_text(encoding="utf-8", errors="replace")
+    for m in _RE_SHADER_ARRAY.finditer(text):
+        if m.group("name") == shader_symbol:
+            blob = _full_blob_bytes(m.group("body"))
+            if not blob:
+                raise LookupError(f"shader array {shader_symbol!r} has no byte literals")
+            return blob
+    raise LookupError(f"shader array {shader_symbol!r} not found in {file_path}")
+
+
+def dump_shader_blob(
+    db_path: Path,
+    output_path: Path,
+    *,
+    shader_symbol: str | None = None,
+    crc32_hex: str | None = None,
+    crc32_decimal: int | str | None = None,
+) -> dict[str, Any]:
+    if shader_symbol is None:
+        matches = find_shader_blobs_by_shader_toggler_crc32(
+            db_path,
+            crc32_hex=crc32_hex,
+            crc32_decimal=crc32_decimal,
+            limit=1000,
+        )
+        if not matches:
+            target = _normalise_shader_toggler_crc32(
+                crc32_hex=crc32_hex,
+                crc32_decimal=crc32_decimal,
+            )
+            raise LookupError(f"no shader blob has ShaderToggler CRC32 {target}")
+        selected = matches[0]
+        match_count = len(matches)
+    else:
+        matches = list_shader_blobs(db_path, limit=1_000_000)
+        by_symbol = {m["symbol"]: m for m in matches}
+        selected = by_symbol.get(shader_symbol)
+        if selected is None:
+            raise LookupError(f"shader symbol {shader_symbol!r} not in index")
+        match_count = 1
+
+    blob = _shader_blob_bytes_from_source(Path(selected["file_path"]), selected["symbol"])
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(blob)
+    return {
+        "ok": True,
+        "shader_symbol": selected["symbol"],
+        "format": selected["format"],
+        "hash_hex": selected["hash_hex"],
+        "shader_toggler_crc32": selected["shader_toggler_crc32"],
+        "shader_toggler_crc32_decimal": selected["shader_toggler_crc32_decimal"],
+        "source_file": selected["file_path"],
+        "source_line": selected["line_number"],
+        "output_path": str(output_path),
+        "bytes_written": len(blob),
+        "match_count": match_count,
+    }
+
+
+# ---------------------------------------------------------------------------
+# DXBC / DXIL container reflection (RDEF chunk)
+# ---------------------------------------------------------------------------
+#
+# Public Microsoft format. The DXBC container layout:
+#   [4]  magic   'DXBC'
+#   [16] hash    MD5-ish container hash
+#   [4]  version (always 1)
+#   [4]  total_size
+#   [4]  chunk_count
+#   [chunk_count * 4] chunk_offsets (each into the container)
+# Each chunk:
+#   [4]  fourcc (e.g. 'RDEF', 'ISGN', 'OSGN', 'DXIL', 'STAT')
+#   [4]  chunk_size (bytes following this header)
+#   [chunk_size] chunk data
+#
+# RDEF (Resource Definition) chunk layout:
+#   [4]  constant_buffers_count
+#   [4]  constant_buffers_offset
+#   [4]  resource_bindings_count
+#   [4]  resource_bindings_offset
+#   [4]  shader_version
+#   [4]  flags
+#   [4]  creator_offset
+#
+# ResourceBinding entry (32 bytes):
+#   [4]  name_offset             (offset from RDEF chunk start to NUL-terminated name)
+#   [4]  shader_input_type
+#   [4]  resource_return_type
+#   [4]  resource_dimension
+#   [4]  sample_count
+#   [4]  bind_point              (= shader register, e.g. 0 for t0)
+#   [4]  bind_count
+#   [4]  flags
+
+
+_SHADER_INPUT_TYPE = {
+    0: "CBUFFER",
+    1: "TBUFFER",
+    2: "TEXTURE",
+    3: "SAMPLER",
+    4: "UAV_RWTYPED",
+    5: "STRUCTURED",
+    6: "UAV_RWSTRUCTURED",
+    7: "BYTEADDRESS",
+    8: "UAV_RWBYTEADDRESS",
+    9: "UAV_APPEND_STRUCTURED",
+    10: "UAV_CONSUME_STRUCTURED",
+    11: "UAV_RWSTRUCTURED_WITH_COUNTER",
+    12: "RTACCELERATIONSTRUCTURE",
+    13: "UAV_FEEDBACKTEXTURE",
+}
+
+_REGISTER_CLASS_FROM_INPUT_TYPE = {
+    0: "CBV",      # CBUFFER → b register
+    1: "SRV",      # TBUFFER → t register
+    2: "SRV",      # TEXTURE → t register
+    3: "SAMPLER",  # SAMPLER → s register
+    4: "UAV",
+    5: "SRV",
+    6: "UAV",
+    7: "SRV",
+    8: "UAV",
+    9: "UAV",
+    10: "UAV",
+    11: "UAV",
+    12: "SRV",
+    13: "UAV",
+}
+
+# RD11 variant of RDEF (DX11+) extends the binding entry to 40 bytes by
+# appending: [4] register_space, [4] resource_id. Detect via the
+# constant_buffers_offset being > 28 (the base RDEF header), but the
+# simpler probe is the RD11 marker DWORD = 0x46443131 right after the
+# 7-DWORD base header in some shaders compiled with /Fc. We detect by
+# size alone: if the binding stride times count fits 40, prefer RD11.
+
+
+def parse_dxbc_container(data: bytes) -> dict[str, Any]:
+    """Decode a DXBC / DXIL container header and chunk index.
+
+    Returns ``{"ok": True, "magic": "DXBC", "chunks": [{fourcc, offset, size}...]}``
+    or ``{"ok": False, "error": ...}``.
+    """
+    import struct
+
+    if len(data) < 32 or data[:4] != b"DXBC":
+        return {
+            "ok": False,
+            "error": "not a DXBC container (magic mismatch or too short)",
+            "magic": data[:4].decode("latin-1", errors="replace") if data else "",
+        }
+    hash16 = data[4:20].hex()
+    version, total_size, chunk_count = struct.unpack_from("<III", data, 20)
+    chunks: list[dict[str, Any]] = []
+    for i in range(chunk_count):
+        off = struct.unpack_from("<I", data, 32 + i * 4)[0]
+        if off + 8 > len(data):
+            continue
+        fourcc = data[off : off + 4]
+        size = struct.unpack_from("<I", data, off + 4)[0]
+        chunks.append(
+            {
+                "fourcc": fourcc.decode("latin-1", errors="replace"),
+                "offset": off,
+                "size": size,
+            }
+        )
+    return {
+        "ok": True,
+        "magic": "DXBC",
+        "hash16": hash16,
+        "version": version,
+        "total_size": total_size,
+        "chunk_count": chunk_count,
+        "chunks": chunks,
+        "evidence_label": "proven",
+    }
+
+
+def parse_rdef_chunk(data: bytes, chunk_offset: int, chunk_size: int) -> dict[str, Any]:
+    """Decode an RDEF (Resource Definition) chunk's resource binding table.
+
+    The chunk is read relative to ``chunk_offset`` inside ``data``. Returns
+    a structured list of resource bindings (name, shader register, register
+    space, type) so callers can map ``t0`` / ``s0`` / ``b1`` etc to names.
+    """
+    import struct
+
+    body_offset = chunk_offset + 8
+    if body_offset + 28 > len(data):
+        return {"ok": False, "error": "RDEF chunk too small for base header"}
+    (
+        cb_count,
+        cb_offset,
+        rb_count,
+        rb_offset,
+        shader_version,
+        flags,
+        creator_offset,
+    ) = struct.unpack_from("<IIIIIII", data, body_offset)
+
+    # Detect RD11 by trying the next DWORD which should be 60 (sizeof RD11) for SM 5.1+.
+    rd11 = False
+    extra_size = 0
+    if body_offset + 32 <= len(data):
+        marker_or_size = struct.unpack_from("<I", data, body_offset + 28)[0]
+        # On RD11 shaders the marker dword equals 60 (interface slots) or 28 etc.
+        # We use binding-stride probing instead: if rb_count and rb_offset are set,
+        # check whether 40-byte stride fits inside chunk_size.
+        if rb_count and rb_offset:
+            stride32 = 32
+            stride40 = 40
+            extent32 = rb_offset + rb_count * stride32
+            extent40 = rb_offset + rb_count * stride40
+            if extent40 <= chunk_size and (
+                marker_or_size in (60, 28) or extent32 > chunk_size
+            ):
+                rd11 = True
+                extra_size = 8
+    binding_stride = 32 + (8 if rd11 else 0)
+
+    bindings: list[dict[str, Any]] = []
+    rdef_base = body_offset
+    for i in range(rb_count):
+        off = rdef_base + rb_offset + i * binding_stride
+        if off + binding_stride > len(data):
+            bindings.append({"index": i, "error": "binding past chunk end"})
+            continue
+        fields = struct.unpack_from("<IIIIIIII", data, off)
+        name_off, sit, return_type, dim, sample_count, bind_point, bind_count, b_flags = fields
+        name_abs = rdef_base + name_off
+        end = data.find(b"\x00", name_abs)
+        if end == -1:
+            end = min(name_abs + 256, len(data))
+        name = data[name_abs:end].decode("latin-1", errors="replace")
+        entry: dict[str, Any] = {
+            "index": i,
+            "name": name,
+            "shader_input_type_id": sit,
+            "shader_input_type": _SHADER_INPUT_TYPE.get(sit, f"unknown({sit})"),
+            "register_class": _REGISTER_CLASS_FROM_INPUT_TYPE.get(sit, "?"),
+            "resource_return_type": return_type,
+            "resource_dimension": dim,
+            "sample_count": sample_count,
+            "shader_register": bind_point,
+            "bind_count": bind_count,
+            "flags": b_flags,
+        }
+        if rd11 and off + 40 <= len(data):
+            space, res_id = struct.unpack_from("<II", data, off + 32)
+            entry["register_space"] = space
+            entry["resource_id"] = res_id
+        else:
+            entry["register_space"] = 0
+        # Map to canonical register notation like "t0 space0".
+        cls = entry["register_class"]
+        if cls in ("SRV", "UAV", "SAMPLER", "CBV"):
+            letter = {"SRV": "t", "UAV": "u", "SAMPLER": "s", "CBV": "b"}[cls]
+            entry["register"] = f"{letter}{bind_point}"
+        bindings.append(entry)
+    return {
+        "ok": True,
+        "constant_buffers_count": cb_count,
+        "constant_buffers_offset": cb_offset,
+        "resource_bindings_count": rb_count,
+        "resource_bindings_offset": rb_offset,
+        "shader_version_raw": shader_version,
+        "flags": flags,
+        "creator_offset": creator_offset,
+        "rd11": rd11,
+        "binding_stride": binding_stride,
+        "bindings": bindings,
+        "evidence_label": "proven",
+    }
+
+
+def shader_reflection_bindings(data: bytes) -> dict[str, Any]:
+    """High-level entry point: parse a DXBC/DXIL container and return its
+    resource binding table (RDEF chunk) plus a list of every chunk fourcc.
+    """
+    container = parse_dxbc_container(data)
+    if not container["ok"]:
+        return container
+    rdef = next((c for c in container["chunks"] if c["fourcc"] == "RDEF"), None)
+    if rdef is None:
+        return {
+            "ok": True,
+            "container": container,
+            "rdef": {"ok": False, "error": "no RDEF chunk in container"},
+            "bindings": [],
+        }
+    rdef_parsed = parse_rdef_chunk(data, rdef["offset"], rdef["size"])
+    return {
+        "ok": True,
+        "container": container,
+        "rdef": rdef_parsed,
+        "bindings": rdef_parsed.get("bindings", []),
+        "evidence_label": "proven",
+    }
