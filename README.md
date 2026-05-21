@@ -196,7 +196,93 @@ confirmed on-wire. The two remaining angles are:
 
 Both are documented in `docs/RPC_PROTOCOL.md`.
 
-### Capture session management + inspection
+### RPC probing, transcripts, and live-event mapping
+
+Helpers that sit one layer above the raw wire protocol — for resolving
+endpoints, recording real `ngfx-ui` ↔ `ngfx-rpc` exchanges, replaying
+those transcripts offline, and mapping a hook-side ordinal back to a
+saved-capture `event_index`.
+
+| Tool | What it does |
+| --- | --- |
+| `ngfx_rpc_endpoint_resolve` | Resolve an `ngfx-rpc` process (or explicit args) to TCP / named-pipe endpoint info. |
+| `ngfx_rpc_endpoint_probe` | Resolve and probe an endpoint, classifying BinaryReplay readiness. |
+| `ngfx_rpc_find_live_events` | Scan live BinaryReplay `EventDetails` to map hook draw ordinals to saved `event_index` values. |
+| `ngfx_rpc_decode_frame` | Decode one ngfx-rpc transport frame or raw message body from hex. |
+| `ngfx_rpc_transcript_import` | Import and decode a JSON / NDJSON / plain-hex transcript. |
+| `ngfx_rpc_session_binding_report` | Summarize BinaryReplay session/slot binding evidence from a frame transcript. |
+| `ngfx_rpc_capture_open_sequence_report` | Structured digest of the known + observed capture-open sequence. |
+| `ngfx_rpc_direct_export_binding_candidate` | Derive a direct saved-C++ RPC binding candidate from a transcript. |
+| `ngfx_cpp_capture_saved_direct_rpc_export` | Future direct FrameDebugger serialize-RPC export entrypoint (gated on the binding candidate). |
+
+### ETW kernel-file capture of `ngfx-ui` ↔ `ngfx-rpc`
+
+A short-lived ETW session that watches kernel file / pipe I/O so the MCP
+can observe the real bytes exchanged between the Nsight UI and
+`ngfx-rpc.exe` for offline decoding. Wraps `logman` + `tracerpt`.
+
+| Tool | What it does |
+| --- | --- |
+| `ngfx_rpc_etw_environment` | Probe for `logman` / `tracerpt` and report whether ETW capture is usable. |
+| `ngfx_rpc_etw_capture_start` | Start a kernel-file ETW session targeted at the UI ↔ RPC I/O. |
+| `ngfx_rpc_etw_capture_stop` | Stop a previously-started ETW session. |
+| `ngfx_rpc_etw_capture_summary` | Convert an `.etl` trace to XML / CSV via `tracerpt` and summarize event counts. |
+
+### PE-patch planner for `ngfx-rpc.exe`
+
+One of the three documented workarounds for the private-bridge wall: a
+non-destructive patch plan that adds logger trampolines into
+`ngfx-rpc.exe` so its private serializers emit byte-level evidence at
+runtime. Plans are emitted, not applied — apply with an external patcher
+or via the IDA script tool below.
+
+| Tool | What it does |
+| --- | --- |
+| `ngfx_rpc_pe_patch_plan` | Plan (do NOT apply) a logger-trampoline patch on `ngfx-rpc.exe`. |
+| `ngfx_rpc_pe_patch_ida_script` | Emit an IDA Pro 9.0 headless Python script that implements the plan. |
+
+### Pylon private-bridge RE — saved-capture → C++ export
+
+`PylonPlugin.dll` runs the UI activity bridge that maps activity id 3 to
+*Generate C++ Capture*. The full headless replacement still depends on
+either re-entering Pylon's private activity manager or wiring the direct
+FrameDebugger Core RPC. These tools preserve the current RE evidence and
+let an LLM iterate on each path safely.
+
+| Tool | What it does |
+| --- | --- |
+| `ngfx_pylon_private_bridge_re_report` | Report what remains to build the private Pylon/BinaryReplay executor. |
+| `ngfx_pylon_bridge_probe_plan` | Return a concrete probe plan for Pylon's private activity-manager bridge. |
+| `ngfx_pylon_activity_manager_static_binding_report` | Extract the static activity-manager / direct-call binding from cached IDA facts. |
+| `ngfx_pylon_bridge_helper_scaffold` | Write a Frida / native helper scaffold for pinning the private executor. |
+| `ngfx_pylon_bridge_probe_run` | Run the Pylon Frida probe and analyze collected private-binding events. |
+| `ngfx_pylon_bridge_probe_log_analyze` | Analyze Frida probe output into binding hypotheses without re-running. |
+| `ngfx_pylon_private_binding_from_probe` | Convert probe output into a private bridge binding JSON. |
+| `ngfx_pylon_direct_call_binding_from_probe` | Build the experimental direct-call binding for `PylonPlugin!sub_180116CD0`. |
+| `ngfx_pylon_frida_direct_call_run` | Run the experimental Frida direct re-entry call into `sub_180116CD0`. |
+| `ngfx_pylon_private_bridge_invoke` | Guarded entrypoint for invoking the future native Pylon bridge. |
+| `ngfx_pylon_saved_cpp_export` | Package the private Pylon saved-capture C++ export inputs. |
+| `ngfx_private_executor_readiness_report` | Report whether Pylon or direct-RPC private export is ready to invoke. |
+| `ngfx_private_executor_evidence_bundle` | Bundle Pylon / RPC private-executor evidence into one artifact. |
+
+### Saved-capture → C++ Capture autonomy + route picker
+
+Pickers and one-shot orchestrators that turn the saved-capture export
+into a chain you can drive end-to-end without the UI. Use
+`ngfx_deep_capture_capability_report` (above) first to decide whether
+this route is worth attempting on the current install.
+
+| Tool | What it does |
+| --- | --- |
+| `ngfx_cpp_capture_pick_install` | Pick the newest installed Nsight whose Generate C++ Capture can run against this capture. |
+| `ngfx_cpp_capture_compatibility_check` | Check whether a saved capture is replayable by a given install. |
+| `ngfx_cpp_capture_route_probe` | Probe the installed Nsight to decide which saved-capture → C++ route to try. |
+| `ngfx_cpp_capture_against_replay` | Run *Generate C++ Capture* against `ngfx-replay.exe` replaying a saved capture. |
+| `ngfx_cpp_capture_recapture_plan` | Emit the `ngfx-capture.exe` command that re-captures the original application. |
+| `ngfx_capture_recapture_with_install` | Re-run the captured application via the picked install's `ngfx-capture.exe`. |
+| `ngfx_cpp_capture_full_autonomy` | One-shot autonomous chain for saved-capture → C++ project → validation + indexing. |
+
+
 
 | Tool | What it answers |
 | --- | --- |
@@ -247,6 +333,20 @@ Both are documented in `docs/RPC_PROTOCOL.md`.
 | `ngfx_gputrace_export_summary` | Summarize Nsight GPU Trace auto-export folders, including `REPRO_INFO.xls` and metric tables. |
 | `ngfx_gputrace_export_search` | Search exported GPU Trace text/XLS files for shader names, hashes, or event text. |
 | `ngfx_gputrace_archs` | List GPU architectures accepted by `--architecture`. |
+
+#### Binary WRPV `.ngfx-gputrace` inspection (RE-derived)
+
+Some Nsight builds emit GPU Trace as a binary WRPV container rather than
+the documented zip. These tools probe that format directly without
+needing to extract it first.
+
+| Tool | What it does |
+| --- | --- |
+| `ngfx_gputrace_wrpv_search` | Search a binary WRPV `.ngfx-gputrace` for needles (strings or hex). |
+| `ngfx_gputrace_wrpv_strings` | Extract printable strings from a WRPV report with byte offsets. |
+| `ngfx_gputrace_wrpv_sections` | Best-effort listing of header-like fields in a WRPV report. |
+| `ngfx_gputrace_wrpv_table_preview` | Hex + ASCII preview of `length` bytes at `offset` inside a WRPV report. |
+| `ngfx_gputrace_shader_bindings` | Search a WRPV report for shader binding evidence (pipeline, root params, descriptor heaps). |
 
 ### Generate C++ Capture → build → run
 
@@ -325,6 +425,9 @@ The workflow these tools enable:
 | `ngfx_cpp_capture_query_calls` | Filtered query: kind / api / name / regex / contains / event range. |
 | `ngfx_cpp_capture_descriptor_bindings` | Reconstruct full bound state at an event by scanning backwards (D3D12 root params + descriptor heaps + IA/OM/RTs; Vulkan pipeline + descriptor sets per `first_set` + VB/IB/push constants). |
 | `ngfx_cpp_capture_sql` | Read-only SELECT/WITH escape hatch against the index. |
+| `ngfx_capture_descriptor_heap_timeline` | Per-heap timeline of descriptor-related D3D12 calls in event order. |
+| `ngfx_capture_root_signature_ranges` | Parse every D3D12 root-signature blob referenced by the C++ project (root params + descriptor-table ranges). |
+| `ngfx_capture_root_signature_lookup` | Resolve a shader register (e.g. `t0` in space `0`) to the root-parameter index that satisfies it. |
 
 The same parser is used by `ngfx_find_calls_by_arg` and by
 `ngfx_resolve_handle` when a sibling C++-Capture index is present.
@@ -409,6 +512,57 @@ visual bug before patching shaders.
 | `ngfx_autofix_loop_plan` | Return the autonomous patch/test/scoring loop. |
 | `ngfx_validate_fix_claim` | Evidence gate for accepting/rejecting an automated visual-fix claim. |
 | `ngfx_shader_fix_regression_score` | Score before/after fix metrics with repeatability, left-eye drift, event-sequence, and PSO coverage gates. |
+| `ngfx_fix_attempt_log` | Append-only JSONL log of fix attempts (inputs, scores, verdicts). |
+| `ngfx_fix_claim_evidence_bundle` | Bundle a fix-claim's evidence into a single zip for review. |
+
+### Resource write history & producer lineage
+
+Static, event-order analyses built on the C++-Capture index, useful for
+"who wrote to this render target before the bad draw?" and for diffing
+left/right eye resource histories.
+
+| Tool | What it does |
+| --- | --- |
+| `ngfx_resource_write_history` | Every write to a named resource in event order — render targets, dispatches, copies, barriers. |
+| `ngfx_resource_write_history_pair_diff` | Diff the write timelines for a LEFT/RIGHT resource pair. |
+| `ngfx_resource_producer_lineage` | Recursively trace which draws produced a given render-target resource. |
+| `ngfx_producer_lineage_pair_diff` | Trace LEFT and RIGHT producer lineages and diff them level-by-level. |
+| `ngfx_copyrect_t0_resolution_report` | Resolve actual sampled state for paired left/right CopyRectPS draws. |
+
+### Subnautica 2 fog & CopyRectPS automation (worked-example shader-fix harness)
+
+A concrete, end-to-end shader-fix harness for the SN2 right-eye fog and
+CopyRectPS bugs. These tools double as a reference template for wiring
+a fix loop against any specific game.
+
+#### SN2 fog (VoxelizePS / VoxelizeGS)
+
+| Tool | What it does |
+| --- | --- |
+| `ngfx_sn2_fog_artifacts` | Locate the latest clean r.Fog on/off and VoxelizePS/VoxelizeGS artifacts. |
+| `ngfx_sn2_fog_signal_report` | Evaluate the clean r.Fog differential for the VoxelizePS/VoxelizeGS bug. |
+| `ngfx_sn2_fog_fix_plan` | Return the autonomous shader/runtime plan for fixing the SN2 fog signal. |
+| `ngfx_sn2_fog_descriptor_probe_plan` | Build live BinaryReplay requests for resolving fog descriptor / resource state. |
+| `ngfx_sn2_fog_slot_candidates` | Resolve VoxelizeGS/VoxelizePS slots from a live descriptor-state reply. |
+| `ngfx_sn2_fog_probe_manifest` | Write or return the GS-first SN2 fog probe manifest for the fix loop. |
+| `ngfx_sn2_fog_live_state_probe` | Collect live Nsight state for one SN2 fog lead-draw BinaryReplay event. |
+
+#### SN2 CopyRectPS (right-eye texture copy)
+
+| Tool | What it does |
+| --- | --- |
+| `ngfx_sn2_copyrect_artifacts` | Locate SN2 CopyRectPS trace and shader-inspection artifacts. |
+| `ngfx_sn2_copyrect_signal_report` | Trace CopyRectPS source texture, destination target, and producer evidence. |
+| `ngfx_sn2_copyrect_fix_plan` | Return the Nsight-driven fix plan for the SN2 CopyRectPS path. |
+| `ngfx_sn2_copyrect_descriptor_probe_plan` | Build live BinaryReplay requests for resolving CopyRectPS t0/s0 and target state. |
+| `ngfx_sn2_copyrect_slot_candidates` | Resolve CopyRectPS t0/s0 slots from a live descriptor-state reply. |
+| `ngfx_sn2_copyrect_t0_source_compare` | Compare live left/right CopyRectPS PS t0 resources after descriptor-state resolution. |
+| `ngfx_sn2_copyrect_pair_analysis` | Compare left/right CopyRectPS draws and emit live-probe targets. |
+| `ngfx_sn2_copyrect_right_eye_issue_report` | Report the strongest same-frame CopyRectPS evidence for the right-eye bug. |
+| `ngfx_sn2_copyrect_source_lineage_report` | Mine saved CopyRectPS resource lineage while preserving the table-scan descriptor caveat. |
+| `ngfx_sn2_copyrect_runtime_instrumentation_plan` | Runtime hook manifest for proving CopyRectPS t0 and rect state. |
+| `ngfx_sn2_copyrect_live_state_probe` | Collect live Nsight state for one CopyRectPS BinaryReplay event. |
+| `ngfx_sn2_copyrect_live_pair_probe` | Probe paired left/right CopyRectPS events and resolve whether actual PS t0 matches. |
 
 ### Object handle / UID resolver
 
@@ -475,13 +629,15 @@ headless to cache compact JSON facts for those gaps.
 | `ngfx_project_create` / `ngfx_project_read` / `ngfx_project_update` | Author / read / mutate `.nsight-gfxproj` XML so subsequent `ngfx --project <file>` invocations are reproducible. |
 | `ngfx_open_in_ui` | Spawn the full Nsight Graphics UI with a capture / gputrace / project preloaded. |
 
-### Shader compilation
+### Shader compilation + reflection + disassembly
 
 | Tool | What it does |
 | --- | --- |
 | `ngfx_glslang_compile` | Compile GLSL → SPIR-V (uses bundled `glslang.exe`). |
 | `ngfx_dxc_compile` | Compile HLSL via DXC (bundled `dxc.exe` if present, else `dxc` on PATH). |
 | `ngfx_shaderdebugger_configure` | Run `nv-shaderdebugger-configurator.exe`. |
+| `ngfx_shader_reflection_bindings` | Parse the RDEF (resource-binding) chunk of a DXBC/DXIL container — register → name mapping for `t0`/`s0`/`u0`/`b0` slots. |
+| `ngfx_shader_disassembly_summary` | Best-effort shader disassembly summary via `dxc.exe -dumpbin`. |
 
 ### Discovery + escape hatch
 
@@ -496,7 +652,7 @@ headless to cache compact JSON facts for those gaps.
 
 ## How big is the surface?
 
-**221 MCP tools** as of this writing, grouped by the sections below.
+**252 MCP tools** (+ 4 prompts) as of this writing, grouped by the sections below.
 Run `nsight-graphics-mcp --list-tools` (or import the package and inspect
 `server`) for an up-to-date enumeration.
 
@@ -827,18 +983,31 @@ src/nsight_graphics_mcp/
   captures.py            # capture-dir discovery + diff (Recent Captures parity)
   capture_diff.py        # event-stream LCS diff between two captures
   capture_format.py      # low-level .ngfx-gfxcap inspection (RE-derived)
+  capture_decoder.py     # direct .ngfx-gfxcap header/chunk/TOC decoder
+  deep_capture.py        # capability report for deep Nsight-only capture analysis
   events.py              # function-stream indexer (Event List parity)
-  gputrace.py            # .nsight-gputrace zip inspection
+  gputrace.py            # .nsight-gputrace zip + WRPV binary inspection
   cpp_capture.py         # MSBuild + run for Generate-C++-Capture output
   cpp_capture_parser.py  # walk emitted .cpp, index per-call args into SQLite
+  cpp_bridge_re.py       # saved-capture → C++ export private-bridge RE helpers
   proto_schemas.py       # name-only protobuf schema inventory
   proto_descriptors.py   # full FileDescriptorProto extraction → DescriptorPool
+  rpc_client.py          # ngfx-rpc.exe custom transport client (RE-derived)
+  rpc_trace.py           # offline ngfx-rpc frame transcript decoder
+  frame_debugger_rpc.py  # persistent private frame-debugger RPC sessions
+  etw_capture.py         # logman/tracerpt ETW kernel-file capture wrappers
+  pe_patch_planner.py    # PE-patch planner for ngfx-rpc.exe logger trampolines
+  ida_re.py              # IDA Pro headless RE helpers
   handle_resolver.py     # object handle → create call + role-bucketed mentions
   pso_resolver.py        # PSO → DXBC/SPIR-V hash mapping (Nsight CLI gap)
   frame_costs.py         # Top-N by GPU time from perf-report dirs / gputrace zips
   objects.py             # object index (Resources / Pipelines pane parity)
   project.py             # .nsight-gfxproj XML authoring
   shaders.py             # glslang + DXC + shaderdebugger configurator wrappers
+  shader_debug.py        # shader-debug orchestration (RE-cache gating + plans)
+  shader_triage.py       # shader visual-bug triage composition layer
+  eye_issue.py           # saved-capture stereo eye-issue triage
+  autonomous_shader_fix.py # deterministic helpers for an LLM-driven fix loop
   layers.py              # Vulkan/VKSC/XR layer (un)install scripts
   sdk.py                 # NGFX in-app SDK header reference + codegen
   ui.py                  # ngfx-ui.exe hand-off
@@ -863,7 +1032,7 @@ MIT.
 
 ## Full tool reference
 
-Auto-generated from `server.py` docstrings. **221 tools** organised by
+Auto-generated from `server.py` docstrings. **252 tools** organised by
 the section comments in `server.py` — the order matches what you'd
 discover scrolling the file.
 
@@ -1153,4 +1322,120 @@ discover scrolling the file.
 - **`ngfx_replay_screenshot`** — Replay a capture and dump per-frame screenshots to ``output_dir``.
 - **`ngfx_replay_gpu_frametimes`** — Replay a capture with GPU frametime collection enabled.
 - **`ngfx_replay_run_advanced`** — Run ``ngfx-replay`` with arbitrary flags discovered via reverse-engineering.
+
+### Descriptor heap / root signature timelines
+
+- **`ngfx_capture_descriptor_heap_timeline`** — Per-heap timeline of descriptor-related D3D12 calls in event order.
+- **`ngfx_capture_root_signature_ranges`** — Parse every D3D12 root signature blob referenced by the C++ project (root params + descriptor-table ranges).
+- **`ngfx_capture_root_signature_lookup`** — Resolve a shader register (e.g. ``t0`` in space ``0``) to the root-parameter index that satisfies it.
+
+### Binary WRPV ``.ngfx-gputrace`` inspection
+
+- **`ngfx_gputrace_wrpv_search`** — Search a binary ``.ngfx-gputrace`` (WRPV container) for needles.
+- **`ngfx_gputrace_wrpv_strings`** — Extract printable strings from a WRPV report with byte offsets.
+- **`ngfx_gputrace_wrpv_sections`** — Best-effort listing of header-like fields in a WRPV report.
+- **`ngfx_gputrace_wrpv_table_preview`** — Hex + ASCII preview of ``length`` bytes at ``offset`` inside a WRPV report.
+- **`ngfx_gputrace_shader_bindings`** — Search a WRPV report for shader binding evidence.
+
+### Shader reflection + disassembly
+
+- **`ngfx_shader_reflection_bindings`** — Parse the RDEF (resource binding) chunk of a DXBC/DXIL shader container — register → name mapping for ``t0`` / ``s0`` / ``u0`` / ``b0`` slots.
+- **`ngfx_shader_disassembly_summary`** — Best-effort shader disassembly summary via ``dxc.exe -dumpbin``.
+
+### RPC probing, transcripts, and live-event mapping
+
+- **`ngfx_rpc_endpoint_resolve`** — Resolve an ``ngfx-rpc`` process or explicit args to TCP / named-pipe endpoint info.
+- **`ngfx_rpc_endpoint_probe`** — Resolve and probe an RPC endpoint, classifying BinaryReplay readiness.
+- **`ngfx_rpc_find_live_events`** — Scan live BinaryReplay ``EventDetails`` to map hook draw ordinals to saved ``event_index`` values.
+- **`ngfx_rpc_decode_frame`** — Decode one ngfx-rpc transport frame or raw message body from hex.
+- **`ngfx_rpc_transcript_import`** — Import and decode a JSON / NDJSON / plain-hex ngfx-rpc transcript.
+- **`ngfx_rpc_session_binding_report`** — Summarize BinaryReplay session / slot binding evidence from a frame transcript.
+- **`ngfx_rpc_capture_open_sequence_report`** — Structured digest of the known + observed capture-open sequence.
+- **`ngfx_rpc_direct_export_binding_candidate`** — Derive a direct saved-C++ RPC binding candidate from a transcript.
+- **`ngfx_cpp_capture_saved_direct_rpc_export`** — Future direct FrameDebugger serialize-RPC export entrypoint.
+
+### ETW kernel-file capture for ngfx-rpc
+
+- **`ngfx_rpc_etw_environment`** — Probe for Windows ETW capture tools (``logman`` / ``tracerpt``).
+- **`ngfx_rpc_etw_capture_start`** — Start a kernel-file ETW session targeted at ngfx-ui ↔ ngfx-rpc I/O.
+- **`ngfx_rpc_etw_capture_stop`** — Stop a previously-started kernel-file ETW session.
+- **`ngfx_rpc_etw_capture_summary`** — Convert an ETL trace to XML / CSV via ``tracerpt`` and summarize counts.
+
+### PE-patch planner for ngfx-rpc.exe
+
+- **`ngfx_rpc_pe_patch_plan`** — Plan (do NOT apply) a logger-trampoline patch on ``ngfx-rpc.exe``.
+- **`ngfx_rpc_pe_patch_ida_script`** — Emit an IDA Pro 9.0 headless Python script that implements the plan.
+
+### Pylon private-bridge RE (saved-capture → C++ export)
+
+- **`ngfx_pylon_private_bridge_re_report`** — Report what remains to build the private Pylon / BinaryReplay executor.
+- **`ngfx_pylon_bridge_probe_plan`** — Return a concrete probe plan for Pylon's private activity-manager bridge.
+- **`ngfx_pylon_activity_manager_static_binding_report`** — Extract the static activity-manager / direct-call binding from cached IDA facts.
+- **`ngfx_pylon_bridge_helper_scaffold`** — Write a Frida / native helper scaffold for pinning the private executor.
+- **`ngfx_pylon_bridge_probe_log_analyze`** — Analyze Frida probe output into binding hypotheses without re-running.
+- **`ngfx_pylon_private_binding_from_probe`** — Convert probe output into a private bridge binding JSON.
+- **`ngfx_pylon_direct_call_binding_from_probe`** — Build the experimental direct-call binding for ``PylonPlugin!sub_180116CD0``.
+- **`ngfx_pylon_bridge_probe_run`** — Run the Pylon Frida probe and analyze collected private-binding events.
+- **`ngfx_pylon_frida_direct_call_run`** — Run the experimental Frida direct re-entry call into ``sub_180116CD0``.
+- **`ngfx_pylon_private_bridge_invoke`** — Guarded entrypoint for invoking the future native Pylon bridge.
+- **`ngfx_pylon_saved_cpp_export`** — Package the private Pylon saved-capture C++ export inputs.
+- **`ngfx_private_executor_readiness_report`** — Report whether Pylon or direct-RPC private export is ready to invoke.
+- **`ngfx_private_executor_evidence_bundle`** — Bundle Pylon / RPC private-executor evidence into one artifact.
+
+### Saved-capture → C++ Capture autonomy + route picker
+
+- **`ngfx_cpp_capture_pick_install`** — Pick the newest installed Nsight whose Generate C++ Capture can run against this capture.
+- **`ngfx_cpp_capture_compatibility_check`** — Check whether a saved capture is replayable by a given install.
+- **`ngfx_cpp_capture_route_probe`** — Probe the installed Nsight to decide which saved-capture → C++ route to try.
+- **`ngfx_cpp_capture_against_replay`** — Run *Generate C++ Capture* against ``ngfx-replay.exe`` replaying a saved capture.
+- **`ngfx_cpp_capture_recapture_plan`** — Emit the ``ngfx-capture.exe`` command that re-captures the original application.
+- **`ngfx_capture_recapture_with_install`** — Re-run the captured application via the picked install's ``ngfx-capture.exe``.
+- **`ngfx_cpp_capture_full_autonomy`** — One-shot autonomous chain for saved-capture → C++ project → validation + indexing.
+
+### Resource write history & producer lineage
+
+- **`ngfx_resource_write_history`** — Every write to a named resource in event order — render targets, dispatches, copies, barriers.
+- **`ngfx_resource_write_history_pair_diff`** — Diff the write timelines for a LEFT/RIGHT resource pair.
+- **`ngfx_resource_producer_lineage`** — Recursively trace which draws produced a given render-target resource.
+- **`ngfx_producer_lineage_pair_diff`** — Trace LEFT and RIGHT producer lineages and diff them level-by-level.
+- **`ngfx_copyrect_t0_resolution_report`** — Resolve actual sampled state for paired left/right CopyRectPS draws.
+
+### Fix attempt log + claim evidence
+
+- **`ngfx_fix_attempt_log`** — Append-only JSONL log of fix attempts (inputs, scores, verdicts).
+- **`ngfx_fix_claim_evidence_bundle`** — Bundle a fix-claim's evidence into a single zip for review.
+
+### SN2 fog automation (VoxelizePS / VoxelizeGS)
+
+- **`ngfx_sn2_fog_artifacts`** — Locate the latest clean r.Fog on/off and VoxelizePS / VoxelizeGS artifacts.
+- **`ngfx_sn2_fog_signal_report`** — Evaluate the clean r.Fog differential for the VoxelizePS / VoxelizeGS bug.
+- **`ngfx_sn2_fog_fix_plan`** — Return the autonomous shader/runtime plan for fixing the SN2 fog signal.
+- **`ngfx_sn2_fog_descriptor_probe_plan`** — Build live BinaryReplay requests for resolving fog descriptor / resource state.
+- **`ngfx_sn2_fog_slot_candidates`** — Resolve VoxelizeGS / VoxelizePS slots from a live descriptor-state reply.
+- **`ngfx_sn2_fog_probe_manifest`** — Write or return the GS-first SN2 fog probe manifest for the fix loop.
+- **`ngfx_sn2_fog_live_state_probe`** — Collect live Nsight state for one SN2 fog lead-draw BinaryReplay event.
+
+### IDA Pro headless RE bridge
+
+- **`ngfx_ida_environment`** — Discover IDA Pro / Home / Free installs and list known Nsight RE targets.
+- **`ngfx_ida_analyze_binary`** — Run IDA headless over a target and cache strings / xrefs / pseudocode JSON.
+- **`ngfx_ida_search_facts`** — Regex-search cached IDA facts without re-running IDA.
+- **`ngfx_ida_fact_summary`** — Summarize a facts JSON.
+- **`ngfx_ida_command_preview`** — Show the exact headless command shape without running it.
+- **`ngfx_shader_debug_re_status`** — Check whether the RE facts needed for shader-debug automation are cached, and show the implementation sequence.
+
+### SN2 CopyRectPS automation (right-eye texture copy)
+
+- **`ngfx_sn2_copyrect_artifacts`** — Locate SN2 CopyRectPS trace and shader-inspection artifacts.
+- **`ngfx_sn2_copyrect_signal_report`** — Trace CopyRectPS source texture, destination target, and producer evidence.
+- **`ngfx_sn2_copyrect_fix_plan`** — Return the Nsight-driven fix plan for the SN2 CopyRectPS path.
+- **`ngfx_sn2_copyrect_descriptor_probe_plan`** — Build live BinaryReplay requests for resolving CopyRectPS t0/s0 and target state.
+- **`ngfx_sn2_copyrect_slot_candidates`** — Resolve CopyRectPS t0/s0 slots from a live descriptor-state reply.
+- **`ngfx_sn2_copyrect_t0_source_compare`** — Compare live left/right CopyRectPS PS t0 resources after descriptor-state resolution.
+- **`ngfx_sn2_copyrect_pair_analysis`** — Compare left/right CopyRectPS draws and emit live-probe targets.
+- **`ngfx_sn2_copyrect_right_eye_issue_report`** — Report the strongest same-frame CopyRectPS evidence for the right-eye bug.
+- **`ngfx_sn2_copyrect_source_lineage_report`** — Mine saved CopyRectPS resource lineage while preserving the table-scan descriptor caveat.
+- **`ngfx_sn2_copyrect_runtime_instrumentation_plan`** — Runtime hook manifest for proving CopyRectPS t0 and rect state.
+- **`ngfx_sn2_copyrect_live_state_probe`** — Collect live Nsight state for one CopyRectPS BinaryReplay event.
+- **`ngfx_sn2_copyrect_live_pair_probe`** — Probe paired left/right CopyRectPS events and resolve whether actual PS t0 matches.
 
