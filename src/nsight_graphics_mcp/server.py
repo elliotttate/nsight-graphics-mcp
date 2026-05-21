@@ -331,6 +331,7 @@ async def ngfx_graphics_capture_launched(
     hostname: str | None = None,
     project: str | None = None,
     no_timeout: bool = False,
+    no_block_on_first_incompatibility: bool = True,
     verbose: bool = False,
     background: bool = False,
 ) -> dict[str, Any]:
@@ -346,6 +347,10 @@ async def ngfx_graphics_capture_launched(
       * ``frame_index`` — capture a specific 1-based frame index (must be > 1).
       * ``elapsed_time_ms`` — capture once after a countdown.
       * ``hotkey_capture`` — wait for the user to press the capture hotkey.
+
+    ``no_block_on_first_incompatibility`` defaults to true so the capture
+    proceeds through known benign warnings such as D3D11 device creation in
+    D3D12 UE titles.
     """
     s = get_settings()
     flags = _activity_flags(
@@ -355,6 +360,7 @@ async def ngfx_graphics_capture_launched(
         hotkey_capture=hotkey_capture,
         hud_position=hud_position,
         non_portable=non_portable,
+        no_block_on_first_incompatibility=no_block_on_first_incompatibility,
     )
     argv = ngfx_activity_argv(
         s,
@@ -394,6 +400,7 @@ async def ngfx_graphics_capture_attached(
     hostname: str | None = None,
     project: str | None = None,
     no_timeout: bool = False,
+    no_block_on_first_incompatibility: bool = True,
     verbose: bool = False,
     background: bool = False,
 ) -> dict[str, Any]:
@@ -406,6 +413,7 @@ async def ngfx_graphics_capture_attached(
         hotkey_capture=hotkey_capture,
         hud_position=hud_position,
         non_portable=non_portable,
+        no_block_on_first_incompatibility=no_block_on_first_incompatibility,
     )
     argv = ngfx_activity_argv(
         s,
@@ -744,6 +752,7 @@ async def ngfx_replay_run(
     argv: list[str] = [str(s.require_tool("ngfx_replay"))]
     if quiet:
         argv.append("--quiet")
+    argv.append("--no-block-on-incompatibility")
     if loop_count is not None:
         argv += ["-n", str(loop_count)]
     if perf_report_dir:
@@ -7509,7 +7518,13 @@ async def ngfx_replay_screenshot(
     s = get_settings()
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
-    argv: list[str] = [str(s.require_tool("ngfx_replay")), "--quiet", "--replay-screenshot", str(out)]
+    argv: list[str] = [
+        str(s.require_tool("ngfx_replay")),
+        "--quiet",
+        "--no-block-on-incompatibility",
+        "--replay-screenshot",
+        str(out),
+    ]
     if frame_indices:
         argv += ["--replay-screenshot-indices", ",".join(str(i) for i in frame_indices)]
     elif frame_count is not None:
